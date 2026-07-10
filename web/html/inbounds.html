@@ -851,6 +851,7 @@
           <a-select-option value="subTraffic">{{ i18n "pages.inbounds.opSubTraffic" }}</a-select-option>
           <a-select-option value="enable">{{ i18n "pages.inbounds.opEnable" }}</a-select-option>
           <a-select-option value="disable">{{ i18n "pages.inbounds.opDisable" }}</a-select-option>
+          <a-select-option value="delete">{{ i18n "pages.inbounds.opDelete" }}</a-select-option>
         </a-select>
       </a-form-item>
       <a-form-item v-if="bulkIsNumericOp()" label='{{ i18n "pages.inbounds.amount" }}'>
@@ -1597,6 +1598,22 @@
         const targets = this.resolveSelectedTargets();
         if (!targets.length) return;
         const b = this.bulkOps;
+        // Delete is destructive + irreversible — require an explicit danger confirm.
+        if (b.op === 'delete') {
+          const okDel = await new Promise((resolve) => {
+            this.$confirm({
+              title: '{{ i18n "pages.inbounds.opDelete" }}',
+              content: '{{ i18n "pages.inbounds.bulkDeleteConfirm" }}'.replace('%COUNT%', targets.length),
+              okText: '{{ i18n "delete" }}',
+              okType: 'danger',
+              class: themeSwitcher.currentTheme,
+              cancelText: '{{ i18n "cancel" }}',
+              onOk: () => resolve(true),
+              onCancel: () => resolve(false),
+            });
+          });
+          if (!okDel) return;
+        }
         const amount = Math.max(0, Number(b.amount) || 0);
         const bytes = b.unit === 'MB' ? 1024 * 1024 : 1024 * 1024 * 1024;
         const base = {

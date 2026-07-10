@@ -94,3 +94,33 @@ func TestBulkUnknownOpRejected(t *testing.T) {
 		t.Fatal("expected error for unknown op")
 	}
 }
+
+// TestBulkClientSkipped covers the skip toggles shared by the update ops and the new
+// "delete" op: a client excluded by a toggle must not be deleted.
+func TestBulkClientSkipped(t *testing.T) {
+	const day = bulkMsPerDay
+	tests := []struct {
+		name   string
+		expiry int64
+		total  int64
+		enable bool
+		req    BulkClientUpdateRequest
+		want   bool
+	}{
+		{"no toggles never skips", -2 * day, 0, false, BulkClientUpdateRequest{Op: "delete"}, false},
+		{"skipFirstUse skips delayed start", -1 * day, 100, true, BulkClientUpdateRequest{Op: "delete", SkipFirstUse: true}, true},
+		{"skipFirstUse keeps active", 5000, 100, true, BulkClientUpdateRequest{Op: "delete", SkipFirstUse: true}, false},
+		{"skipDisabled skips disabled", 5000, 100, false, BulkClientUpdateRequest{Op: "delete", SkipDisabled: true}, true},
+		{"skipDisabled keeps enabled", 5000, 100, true, BulkClientUpdateRequest{Op: "delete", SkipDisabled: true}, false},
+		{"skipUnlimited skips unlimited", 5000, 0, true, BulkClientUpdateRequest{Op: "delete", SkipUnlimited: true}, true},
+		{"skipUnlimited keeps limited", 5000, 100, true, BulkClientUpdateRequest{Op: "delete", SkipUnlimited: true}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := clientMap(tt.expiry, tt.total, tt.enable)
+			if got := bulkClientSkipped(cm, tt.req); got != tt.want {
+				t.Fatalf("bulkClientSkipped = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

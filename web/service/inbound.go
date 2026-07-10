@@ -1419,7 +1419,7 @@ func (s *InboundService) BulkUpdateClients(req BulkClientUpdateRequest) (BulkCli
 	touched := map[string]bool{}
 
 	switch req.Op {
-	case "addDays", "subDays", "addTraffic", "subTraffic", "enable", "disable":
+	case "addDays", "subDays", "addTraffic", "subTraffic", "enable", "disable", "delete":
 	default:
 		return result, touched, common.NewError("unknown bulk operation:", req.Op)
 	}
@@ -1463,36 +1463,82 @@ func (s *InboundService) BulkUpdateClients(req BulkClientUpdateRequest) (BulkCli
 			continue
 		}
 		changed := false
-		for i := range clientsAny {
-			cm, ok := clientsAny[i].(map[string]any)
-			if !ok {
-				continue
-			}
-			email, _ := cm["email"].(string)
-			if email == "" || !emails[email] {
-				continue
-			}
-			if applyBulkClientOp(cm, req, now) {
-				cm["updated_at"] = now
-				clientsAny[i] = cm
-				changed = true
-				result.Applied++
-				// Keep the enforcement table (client_traffics) in sync with the new
-				// limit/expiry/enable. The auto-disable check (disableInvalidClients)
-				// reads client_traffics.total/expiry_time/enable, and those are
-				// otherwise only written by add/updateClient — NOT by a whole-inbound
-				// save — so without this a bulk limit/expiry change would be cosmetic.
-				if e := tx.Model(&xray.ClientTraffic{}).Where("email = ?", email).
-					Updates(map[string]any{
-						"enable":      cm["enable"],
-						"total":       bulkNumToInt64(cm["totalGB"]),
-						"expiry_time": bulkNumToInt64(cm["expiryTime"]),
-					}).Error; e != nil {
-					err = e
-					return result, touched, err
+		if req.Op == "delete" {
+			// Delete removes targeted clients entirely (honouring the skip toggles) and
+			// cleans up their stats + saved IPs. Never empty an inbound — an inbound must
+			// keep >=1 client — so if every client is targeted, one is retained (skipped).
+			del := map[string]bool{}
+			total := 0
+			for i := range clientsAny {
+				cm, ok := clientsAny[i].(map[string]any)
+				if !ok {
+					continue
 				}
-			} else {
-				result.Skipped++
+				total++
+				email, _ := cm["email"].(string)
+				if email != "" && emails[email] && !bulkClientSkipped(cm, req) {
+					del[email] = true
+				}
+			}
+			if total > 0 && len(del) >= total {
+				for e := range del { // keep one client back so the inbound isn't emptied
+					delete(del, e)
+					break
+				}
+			}
+			var kept []any
+			for i := range clientsAny {
+				cm, _ := clientsAny[i].(map[string]any)
+				email, _ := cm["email"].(string)
+				if email != "" && del[email] {
+					if err = s.DelClientStat(tx, email); err != nil {
+						return result, touched, err
+					}
+					if err = s.DelClientIPs(tx, email); err != nil {
+						return result, touched, err
+					}
+					result.Applied++
+					changed = true
+				} else {
+					kept = append(kept, clientsAny[i])
+					if email != "" && emails[email] {
+						result.Skipped++ // targeted but retained (skip toggle or last-client guard)
+					}
+				}
+			}
+			clientsAny = kept
+		} else {
+			for i := range clientsAny {
+				cm, ok := clientsAny[i].(map[string]any)
+				if !ok {
+					continue
+				}
+				email, _ := cm["email"].(string)
+				if email == "" || !emails[email] {
+					continue
+				}
+				if applyBulkClientOp(cm, req, now) {
+					cm["updated_at"] = now
+					clientsAny[i] = cm
+					changed = true
+					result.Applied++
+					// Keep the enforcement table (client_traffics) in sync with the new
+					// limit/expiry/enable. The auto-disable check (disableInvalidClients)
+					// reads client_traffics.total/expiry_time/enable, and those are
+					// otherwise only written by add/updateClient — NOT by a whole-inbound
+					// save — so without this a bulk limit/expiry change would be cosmetic.
+					if e := tx.Model(&xray.ClientTraffic{}).Where("email = ?", email).
+						Updates(map[string]any{
+							"enable":      cm["enable"],
+							"total":       bulkNumToInt64(cm["totalGB"]),
+							"expiry_time": bulkNumToInt64(cm["expiryTime"]),
+						}).Error; e != nil {
+						err = e
+						return result, touched, err
+					}
+				} else {
+					result.Skipped++
+				}
 			}
 		}
 		if !changed {
@@ -1510,6 +1556,24 @@ func (s *InboundService) BulkUpdateClients(req BulkClientUpdateRequest) (BulkCli
 		touched[string(inbound.Protocol)] = true
 	}
 	return result, touched, nil
+}
+
+// bulkClientSkipped reports whether a client is excluded by the request's skip
+// toggles — shared by the update ops and delete: never-used (delayed start),
+// disabled, or unlimited-traffic accounts.
+func bulkClientSkipped(cm map[string]any, req BulkClientUpdateRequest) bool {
+	if req.SkipFirstUse && bulkNumToInt64(cm["expiryTime"]) < 0 {
+		return true
+	}
+	if req.SkipDisabled {
+		if enable, _ := cm["enable"].(bool); !enable {
+			return true
+		}
+	}
+	if req.SkipUnlimited && bulkNumToInt64(cm["totalGB"]) == 0 {
+		return true
+	}
+	return false
 }
 
 // applyBulkClientOp mutates one client map per the request, returning false when the
