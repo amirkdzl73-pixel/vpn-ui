@@ -29,7 +29,8 @@ func TestAllocateBlockIPFreeAndReject(t *testing.T) {
 
 	// free slot: hand out the lowest device IP, no deny.
 	s := &RadiusService{sessions: map[string]*radiusSession{}}
-	ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject", "")
+	blockIPs := vpnAccountDeviceIPs(subs, 0, k)
+	ip, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", "", 0)
 	if deny || ip == nil || ip.String() != "10.0.5.6" {
 		t.Fatalf("free slot: got ip=%v deny=%v want 10.0.5.6/false", ip, deny)
 	}
@@ -40,8 +41,69 @@ func TestAllocateBlockIPFreeAndReject(t *testing.T) {
 		full["sess-"+itoa(d)] = &radiusSession{ip: "10.0.5." + itoa(6+d), protocol: "l2tp", started: time.Now()}
 	}
 	s = &RadiusService{sessions: full}
-	if ip, deny := s.allocateBlockIP(0, k, subs, "l2tp", "reject", ""); ip != nil || !deny {
+	if ip, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", "", 0); ip != nil || !deny {
 		t.Fatalf("full+reject: got ip=%v deny=%v want nil/true", ip, deny)
+	}
+}
+
+// TestAllocateBlockIPPerDevice verifies the User Limit cap counts distinct DEVICES,
+// not distinct public IPs. Two devices on ONE account behind the SAME NAT share a
+// Calling-Station-Id and are told apart only by NAS-Port (the pppd unit). The cap
+// must still bind, a genuine redial (same station+port) must stay idempotent, and a
+// device past the cap must be rejected.
+func TestAllocateBlockIPPerDevice(t *testing.T) {
+	subs := []string{"10.0.5"}
+	const k = 2                // account 0 -> .6, .7
+	const station = "203.0.113.9" // one NAT / public IP shared by every device
+
+	s := &RadiusService{sessions: map[string]*radiusSession{}}
+	blockIPs := vpnAccountDeviceIPs(subs, 0, k)
+
+	// device A (NAS-Port 0) takes the first slot.
+	ipA, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", station, 0)
+	if deny || ipA == nil {
+		t.Fatalf("device A: got ip=%v deny=%v", ipA, deny)
+	}
+
+	// device B — SAME station, different NAS-Port — must get a DISTINCT slot, not
+	// collapse onto A's IP (that collapse was the bug that made K unenforced behind a NAT).
+	ipB, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", station, 1)
+	if deny || ipB == nil {
+		t.Fatalf("device B: got ip=%v deny=%v", ipB, deny)
+	}
+	if ipB.String() == ipA.String() {
+		t.Fatalf("device B collapsed onto device A's IP %s — cap bypassed", ipA)
+	}
+
+	// redial of device A (same station+port) is idempotent: same IP, no new slot consumed.
+	ipA2, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", station, 0)
+	if deny || ipA2 == nil || ipA2.String() != ipA.String() {
+		t.Fatalf("device A redial: got ip=%v deny=%v want %s", ipA2, deny, ipA)
+	}
+
+	// device C — a third distinct device at the K=2 cap — must be rejected.
+	if ip, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", station, 2); ip != nil || !deny {
+		t.Fatalf("device C at cap: got ip=%v deny=%v want nil/true", ip, deny)
+	}
+}
+
+// TestAllocateBlockIPCapOne verifies User Limit K==1 enforces a SINGLE device: the
+// account's one IP goes to the first device, that device's redial stays idempotent,
+// and a second distinct device is rejected (strategy=reject) rather than silently
+// sharing the IP. Guards the fix that made K==1 enforce instead of being a no-op.
+func TestAllocateBlockIPCapOne(t *testing.T) {
+	blockIPs := []string{"10.0.5.7"} // K==1: a single-IP block (the account's legacy IP)
+	s := &RadiusService{sessions: map[string]*radiusSession{}}
+
+	ip1, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", "198.51.100.5", 0)
+	if deny || ip1 == nil || ip1.String() != "10.0.5.7" {
+		t.Fatalf("device 1: got ip=%v deny=%v want 10.0.5.7/false", ip1, deny)
+	}
+	if ip, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", "198.51.100.5", 0); deny || ip == nil || ip.String() != "10.0.5.7" {
+		t.Fatalf("device 1 redial: got ip=%v deny=%v want 10.0.5.7/false", ip, deny)
+	}
+	if ip, deny := s.allocateBlockIP(0, 0, blockIPs, "l2tp", "reject", "198.51.100.5", 1); ip != nil || !deny {
+		t.Fatalf("device 2 at K=1 cap: got ip=%v deny=%v want nil/true", ip, deny)
 	}
 }
 

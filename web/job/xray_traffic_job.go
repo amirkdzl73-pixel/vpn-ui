@@ -26,7 +26,19 @@ type XrayTrafficJob struct {
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
 func NewXrayTrafficJob(rs *service.RadiusService) *XrayTrafficJob {
-	return &XrayTrafficJob{radiusService: rs}
+	j := &XrayTrafficJob{radiusService: rs}
+	// Wire the shared RADIUS server into THIS job's own l2tp/pptp/openvpn service
+	// structs. They are zero-value copies (not the web server's wired instances), so
+	// without this their radiusService is nil and every DisableClients / KillDisabled-
+	// Sessions call silently no-ops (see the `s.radiusService != nil` guards) — which
+	// is why over-quota and disabled l2tp/pptp tunnels were never torn down live and
+	// only got refused at the next reconnect. The secret is irrelevant to the kill
+	// paths (they read the in-memory session map), so pass empty; getRadiusSecret
+	// falls back to the DB if anything else needs it.
+	j.l2tpService.SetRadius(rs, "")
+	j.pptpService.SetRadius(rs, "")
+	j.openvpnService.SetRadius(rs, "")
+	return j
 }
 
 // Run collects traffic statistics from Xray and updates the database, triggering restart if needed.
@@ -54,6 +66,18 @@ func (j *XrayTrafficJob) Run() {
 		clientTraffics = append(clientTraffics, pptpTraffics...)
 		clientTraffics = append(clientTraffics, ovpnTraffics...)
 	}
+
+	// Level-triggered enforcement: disconnect any STILL-connected client that is no
+	// longer allowed (quota/expiry hit, or disabled in settings). The edge-triggered
+	// DisableClients calls below only fire on the exact tick a quota is first crossed;
+	// if that one-shot kill missed, the live VPN tunnel would keep running until the
+	// user reconnects (auth refuses them only then) — the reported "used their 1GB but
+	// kept going" bug. This sweep re-derives the disabled set from the DB each run, so
+	// it is idempotent and cheap when nothing is disabled. Runs before the early-return
+	// so an idle-but-over-quota session is still torn down.
+	j.l2tpService.KillDisabledSessions()
+	j.pptpService.KillDisabledSessions()
+	j.openvpnService.KillDisabledSessions()
 
 	// Skip DB update if no traffic to process
 	if len(traffics) == 0 && len(clientTraffics) == 0 {

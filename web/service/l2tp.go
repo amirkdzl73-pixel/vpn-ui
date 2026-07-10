@@ -32,7 +32,7 @@ type l2tpSettings struct {
 	ClientToClient bool         `json:"clientToClient"`
 	CrossInbound   bool         `json:"crossInbound"`
 	UserLimit         int       `json:"userLimit"`         // simultaneous devices per account (1..64); 1 = legacy
-	UserLimitStrategy string    `json:"userLimitStrategy"` // at the cap: "reject" (default) or "accept" (evict oldest)
+	UserLimitStrategy string    `json:"userLimitStrategy"` // at the cap: "accept" (default, evict oldest) or "reject" (deny new device)
 	IpRanges       []string     `json:"ipRanges"`
 	IpRange        string       `json:"ipRange"` // legacy single-range field (read-only fallback)
 	LocalIp        string       `json:"localIp"`

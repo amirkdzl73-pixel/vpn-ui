@@ -157,10 +157,13 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	challenge := microsoft.MSCHAPChallenge_Get(r.Packet)
 	response := microsoft.MSCHAP2Response_Get(r.Packet)
 
-	// The client's Calling-Station-Id (its remote IP) is stable across a device's
-	// re-authentication/redial, unlike the RADIUS session-id or NAS-Port — so it keys
-	// the per-device block-IP assignment for User Limit K>1 (see allocateBlockIP).
+	// Per-device identity for User Limit K>1 (see allocateBlockIP): Calling-Station-Id
+	// (the client's remote IP) PLUS NAS-Port (the pppd unit number). Two distinct
+	// devices on one account behind the SAME NAT share a Calling-Station-Id, so the
+	// NAS-Port is what tells them apart and keeps the K cap honest; a unit is reused
+	// once freed, so a genuine redial that reclaims it stays idempotent.
 	station := rfc2865.CallingStationID_GetString(r.Packet)
+	nasPort := uint32(rfc2865.NASPort_Get(r.Packet))
 
 	if username == "" || nasID == "" {
 		logger.Debug("RADIUS: auth rejected — missing username or NAS-Identifier")
@@ -246,7 +249,7 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 
 	// Assign deterministic IP so per-user Xray routing works via source IP. A deny
 	// means the account is at its User Limit and the strategy is "reject".
-	clientIP, deny := s.getClientIP(protocol, inboundId, username, station)
+	clientIP, deny := s.getClientIP(protocol, inboundId, username, station, nasPort)
 	if deny {
 		logger.Infof("RADIUS: auth rejected — user-limit reached (strategy=reject) user=%s nas=%s", username, nasID)
 		w.Write(r.Response(radius.CodeAccessReject))
@@ -509,8 +512,12 @@ func (s *RadiusService) KillSessionsByEmail(emails map[string]bool) {
 	s.mu.Unlock()
 
 	for _, ip := range toKill {
-		// Find and kill pppd by the IP it assigned
+		// Graceful first: kill the owning pppd by its pid file (clean shutdown + Acct-Stop).
+		// Then force the link down by deleting the interface — belt-and-suspenders, since the
+		// pid file may be absent/stale, and deleting the interface guarantees the tunnel drops
+		// (this is the same reliable teardown the User Limit eviction uses).
 		s.killPppdByIP(ip)
+		killPPPByIP(ip)
 	}
 }
 
@@ -650,7 +657,7 @@ func (s *RadiusService) findClientInbound(protocol, username string) (*model.Inb
 // if the client is not found or the range is exhausted, and (nil,true) when the
 // account is at its User Limit and the strategy is "reject" — the caller must then
 // send an Access-Reject rather than a keyless Access-Accept.
-func (s *RadiusService) getClientIP(protocol string, inboundId int, username, station string) (net.IP, bool) {
+func (s *RadiusService) getClientIP(protocol string, inboundId int, username, station string, nasPort uint32) (net.IP, bool) {
 	db := database.GetDB()
 	var inbound model.Inbound
 	if inboundId > 0 {
@@ -705,22 +712,41 @@ func (s *RadiusService) getClientIP(protocol string, inboundId int, username, st
 	// block is full the strategy decides: "reject" denies the dial, "accept" evicts
 	// the oldest device. K==1 (and OpenVPN) keeps the legacy per-index IP.
 	k := normUserLimit(settings.UserLimit)
-	if protocol != "openvpn" && k > 1 {
-		subnets := pppSubnetsOrDefault(ranges, protocol, inbound.Id)
+	if protocol != "openvpn" {
+		// Enforce the per-account device cap for EVERY K (>=1). blockIPs is the set of
+		// addresses the account may use: K==1 is a ONE-IP block (the legacy deterministic
+		// IP), so a 2nd device on the account is rejected/evicted instead of silently
+		// sharing the first device's IP (which just breaks routing for one of them).
+		// K>=2 is the account's K consecutive device IPs. (OpenVPN doesn't reach here —
+		// it authenticates via PAP and enforces the cap in its own client-connect hook.)
+		var blockIPs []string
+		if k <= 1 {
+			if ip := computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol); ip != nil {
+				blockIPs = []string{ip.String()}
+			}
+		} else {
+			blockIPs = vpnAccountDeviceIPs(pppSubnetsOrDefault(ranges, protocol, inbound.Id), clientIndex, k)
+		}
+		if len(blockIPs) == 0 {
+			return nil, false
+		}
 		strategy := normUserLimitStrategy(settings.UserLimitStrategy)
-		return s.allocateBlockIP(clientIndex, k, subnets, protocol, strategy, station)
+		return s.allocateBlockIP(inbound.Id, clientIndex, blockIPs, protocol, strategy, station, nasPort)
 	}
 	return computeVpnClientIP(ranges, inbound.Id, clientIndex, protocol), false
 }
 
 // allocateBlockIP assigns a stable IP inside account `clientIndex`'s K-block (User
-// Limit) to the calling device. Devices are keyed by `station` (Calling-Station-Id):
-// a device that re-authenticates keeps the IP it already holds (idempotent), so an
-// unstable/redialing client can't evict itself and reset its traffic counter, nor be
-// handed another device's IP. A new device takes a free slot; when all K are held the
-// strategy decides — "reject" returns (nil,true) so the caller denies, "accept" evicts
-// the account's OLDEST live device. Returns (ip,false) on success, (nil,true) on deny.
-func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, protocol, strategy, station string) (net.IP, bool) {
+// Limit) to the calling device. A device is keyed by (Calling-Station-Id, NAS-Port):
+// the NAS-Port (pppd unit) separates distinct devices that share one public IP behind
+// a NAT — without it they collapse to one slot and the K cap is bypassed — while a
+// redial that reclaims the same freed unit keeps its key and the IP it already holds
+// (idempotent), so an unstable/redialing client can't evict itself and reset its
+// traffic counter, nor be handed another device's IP. A new device takes a free slot;
+// when all K are held the strategy decides — "reject" returns (nil,true) so the caller
+// denies, "accept" evicts the account's OLDEST live device. Returns (ip,false) on
+// success, (nil,true) on deny.
+func (s *RadiusService) allocateBlockIP(inboundId, clientIndex int, blockIPs []string, protocol, strategy, station string, nasPort uint32) (net.IP, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pending == nil {
@@ -732,19 +758,18 @@ func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, pr
 	}
 	now := time.Now()
 
-	// This account's K device IPs.
-	isBlockIP := make(map[string]bool, k)
-	blockIPs := make([]string, 0, k)
-	for d := 0; d < k; d++ {
-		if ip := vpnAccountDeviceIP(subnets, clientIndex, k, d); ip != "" {
-			isBlockIP[ip] = true
-			blockIPs = append(blockIPs, ip)
-		}
+	// This account's device IPs (K of them; K==1 is a single-IP block).
+	isBlockIP := make(map[string]bool, len(blockIPs))
+	for _, ip := range blockIPs {
+		isBlockIP[ip] = true
 	}
 
+	// Device key: (protocol, inbound, account, Calling-Station-Id, NAS-Port). The
+	// NAS-Port (pppd unit) is what distinguishes two distinct devices on one account
+	// behind the same NAT; a redial reclaiming the same freed unit keeps this key.
 	skey := ""
 	if station != "" {
-		skey = fmt.Sprintf("%s:%d:%s", protocol, clientIndex, station)
+		skey = fmt.Sprintf("%s:%d:%d:%s:%d", protocol, inboundId, clientIndex, station, nasPort)
 	}
 
 	// assign claims ip for this station: it wins the slot, so drop any OTHER station's
@@ -801,7 +826,7 @@ func (s *RadiusService) allocateBlockIP(clientIndex, k int, subnets []string, pr
 	}
 
 	// (1) A free slot for this new device.
-	blockSet := make(map[string]bool, k)
+	blockSet := make(map[string]bool, len(blockIPs))
 	for _, ip := range blockIPs {
 		blockSet[ip] = true
 		if !used[ip] {

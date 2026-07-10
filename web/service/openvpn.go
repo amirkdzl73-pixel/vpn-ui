@@ -53,7 +53,7 @@ type openvpnSettings struct {
 	ClientToClient bool                `json:"clientToClient"`
 	CrossInbound   bool                `json:"crossInbound"`
 	UserLimit         int              `json:"userLimit"`         // simultaneous devices per account (1..64); 1 = legacy
-	UserLimitStrategy string           `json:"userLimitStrategy"` // at the cap: "reject" (default) or "accept" (evict oldest)
+	UserLimitStrategy string           `json:"userLimitStrategy"` // at the cap: "accept" (default, evict oldest) or "reject" (deny new device)
 	IpRanges       []string            `json:"ipRanges"`  // UDP-side /24 ranges; TCP mirrors into 10.3.x. Panel-managed.
 	Clients        []openvpnClient     `json:"clients"`
 }
@@ -436,60 +436,55 @@ func (s *OpenVpnService) writeClientConfigDir(inbound *model.Inbound, settings *
 	mask := prefixToMask(prefix)
 	k := normUserLimit(settings.UserLimit)
 
-	// User Limit K>=2: no fixed per-CN pin. Instead publish each account's aligned
-	// block to blocks-<proto>/<CN>; the client-connect hook leases a free IP inside
-	// it per device (duplicate-cn allows K simultaneous sessions on one account).
+	// User Limit K (>=1): publish each account's device-IP block to blocks-<proto>/<CN>
+	// and let the client-connect hook lease a free IP per device and enforce the cap.
+	// K==1 publishes a ONE-IP block, so the account's 2nd device is cleanly rejected (or
+	// its oldest evicted) by the hook — instead of being left to OpenVPN's native
+	// one-per-CN handling, which just makes two same-account clients fight over the
+	// tunnel (a kick war that looks like "both connect"). The empty ccd dir stays
+	// (referenced by the server config); the hook pushes each device's IP via
+	// ifconfig-push.
 	blocksDir := fmt.Sprintf("%s/blocks-%s", s.configDir(inbound.Id), proto)
 	os.RemoveAll(blocksDir)
-	if k > 1 {
-		if err := os.MkdirAll(blocksDir, 0755); err != nil {
-			return err
-		}
-		// Fresh lease dir on every (re)gen — a config change restarts the daemon,
-		// dropping all sessions, so no live lease can be lost here.
-		leaseDir := fmt.Sprintf("%s/leases-%s", s.configDir(inbound.Id), proto)
-		os.RemoveAll(leaseDir)
-		_ = os.MkdirAll(leaseDir, 0755)
+	if err := os.MkdirAll(blocksDir, 0755); err != nil {
+		return err
+	}
+	// Fresh lease dir on every (re)gen — a config change restarts the daemon, dropping
+	// all sessions, so no live lease can be lost here.
+	leaseDir := fmt.Sprintf("%s/leases-%s", s.configDir(inbound.Id), proto)
+	os.RemoveAll(leaseDir)
+	_ = os.MkdirAll(leaseDir, 0755)
 
-		// Publish the User Limit Strategy for the connect hook: "reject" refuses a
-		// (K+1)-th device; "accept" evicts the account's oldest device via the mgmt
-		// socket. One file per proto so udp/tcp share the inbound's setting.
-		strategy := normUserLimitStrategy(settings.UserLimitStrategy)
-		if err := s.writeFile(fmt.Sprintf("%s/strategy-%s", s.configDir(inbound.Id), proto), strategy+"\n"); err != nil {
-			return err
-		}
-
-		subnets := ovpnSubnetsOrDefault(settings, proto, inbound.Id)
-		for i, client := range settings.Clients {
-			if client.ID == "" {
-				continue
-			}
-			ips := vpnAccountDeviceIPs(subnets, i, k)
-			if len(ips) == 0 {
-				continue
-			}
-			// "<serverBlockMask> <ip1> <ip2> ...": the hook leases a free IP from the
-			// list and pushes ifconfig-push <freeIP> <serverBlockMask> (topology
-			// subnet). An explicit IP list, so K need not be a power of two.
-			content := mask + " " + strings.Join(ips, " ") + "\n"
-			if err := s.writeFile(fmt.Sprintf("%s/%s", blocksDir, client.ID), content); err != nil {
-				return err
-			}
-		}
-		return nil
+	// Publish the User Limit Strategy for the connect hook: "reject" refuses an extra
+	// device; "accept" evicts the account's oldest. One file per proto (udp/tcp share it).
+	strategy := normUserLimitStrategy(settings.UserLimitStrategy)
+	if err := s.writeFile(fmt.Sprintf("%s/strategy-%s", s.configDir(inbound.Id), proto), strategy+"\n"); err != nil {
+		return err
 	}
 
-	// K==1 (legacy): pin each account to one deterministic IP via CCD.
+	subnets := ovpnSubnetsOrDefault(settings, proto, inbound.Id)
 	for i, client := range settings.Clients {
 		if client.ID == "" {
 			continue
 		}
-		ip := ovpnBlockClientIP(netAddr, prefix, i)
-		if ip == "" {
+		var ips []string
+		if k <= 1 {
+			// One-IP block = the account's legacy deterministic IP (the same address
+			// the routing map uses for K==1), so per-account source-IP routing still
+			// resolves to the right account.
+			if ip := ovpnBlockClientIP(netAddr, prefix, i); ip != "" {
+				ips = []string{ip}
+			}
+		} else {
+			ips = vpnAccountDeviceIPs(subnets, i, k)
+		}
+		if len(ips) == 0 {
 			continue
 		}
-		content := fmt.Sprintf("ifconfig-push %s %s\n", ip, mask)
-		if err := s.writeFile(fmt.Sprintf("%s/%s", ccdDir, client.ID), content); err != nil {
+		// "<serverBlockMask> <ip1> <ip2> ...": the hook leases a free IP from the list
+		// and pushes ifconfig-push <freeIP> <serverBlockMask> (topology subnet).
+		content := mask + " " + strings.Join(ips, " ") + "\n"
+		if err := s.writeFile(fmt.Sprintf("%s/%s", blocksDir, client.ID), content); err != nil {
 			return err
 		}
 	}
@@ -543,15 +538,14 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	b.WriteString(fmt.Sprintf("server %s %s\n", subnet, subnetMask))
 	// Pin every user to a deterministic tunnel IP so per-user routing rules work.
 	b.WriteString(fmt.Sprintf("client-config-dir %s/ccd-%s\n", dir, proto))
-	// User Limit K>=2: allow K simultaneous sessions per account (same CN). The
-	// client-connect hook leases each device a distinct IP inside the account's
-	// block, so routing-by-source still resolves to the right account.
-	if normUserLimit(settings.UserLimit) > 1 {
-		b.WriteString("duplicate-cn\n")
-		// The "accept" strategy force-disconnects the account's oldest device via
-		// `client-kill <CID>` on the management socket — which is already declared
-		// unconditionally below (status/management block), so nothing to add here.
-	}
+	// User Limit is enforced by the client-connect hook for EVERY K (>=1): it leases
+	// each device an IP from the account's published block and rejects/evicts past the
+	// cap. duplicate-cn lets the hook own that decision uniformly — including K==1,
+	// where OpenVPN's native one-per-CN would otherwise leave two same-account clients
+	// fighting over the tunnel (a kick war) instead of cleanly rejecting the 2nd. The
+	// "accept" strategy kills the oldest device via the management socket (declared
+	// unconditionally below), so nothing extra is needed here.
+	b.WriteString("duplicate-cn\n")
 	if settings.ClientToClient {
 		// Route traffic between clients internally in OpenVPN instead of sending
 		// it to the tun device (where TPROXY would hijack it into Xray). DCO
@@ -926,7 +920,10 @@ func (s *OpenVpnService) generateTlsCryptKey() (string, error) {
 	return b.String(), nil
 }
 
-// KillClient kills a specific client's connection via the management socket.
+// KillClient disconnects a client by common-name via the management socket. Under
+// duplicate-cn (User Limit K>1) `kill <cn>` drops ALL of the account's devices — which
+// is exactly what the disable/expiry callers want (the whole account goes offline).
+// Single-device eviction uses a different path (openvpn-evict, kill by real-address).
 func (s *OpenVpnService) KillClient(inboundId int, username string) {
 	// Try both UDP and TCP management sockets
 	for _, proto := range []string{"udp", "tcp"} {

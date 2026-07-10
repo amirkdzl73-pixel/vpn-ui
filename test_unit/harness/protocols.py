@@ -403,14 +403,42 @@ def _strategy_check(proto, cA, cB, cC, sc, ib, panel, log, phase, server_exec=No
         ok3, ip3, clog3 = _connect(cC, sc, proto, "A")  # 3rd device must be refused
         n3 = checks.internet(cC) if ok3 else None
         admitted = ok3 and n3 is not None and n3.status == Status.PASS
+
+        # Causation: with K == the account's block size, a 3rd device is unroutable even
+        # with NO cap, so "3rd didn't reach the internet" proves nothing on its own.
+        # Assert the SERVER actively refused it. l2tp/pptp: the in-panel RADIUS logs an
+        # explicit user-limit rejection. openvpn: the account must NOT gain a 3rd live
+        # session (an over-admit would show K+1 CLIENT_LIST rows inside its block).
+        refused = False
+        sig = ""
+        if proto == "openvpn":
+            rows = _ovpn_status_rows(server_exec, ib.inbound_id, "udp")
+            live = 0
+            if ip1:
+                p3, b = ip1.rsplit(".", 1)
+                block = {f"{p3}.{int(b) + d}" for d in range(ib.user_limit)}
+                live = sum(1 for r in rows if len(r) > 3 and r[3] in block)
+            refused = 0 < live <= ib.user_limit
+            sig = f"live_sessions={live} (cap K={ib.user_limit})"
+        else:
+            if server_exec is not None:
+                try:
+                    _, rlog, _ = server_exec(
+                        "journalctl -u vpn-ui-panel --no-pager 2>/dev/null | "
+                        "grep 'user-limit reached' | tail -1")
+                    refused = "user-limit reached" in (rlog or "")
+                except Exception:  # noqa: BLE001
+                    pass
+            sig = f"radius_reject_logged={refused}"
+
         rj.log = (f"dev1={ok1}/{ip1} dev2={ok2}/{ip2}\n"
-                  f"dev3 conn={ok3}/{ip3} net={(n3.status.value if n3 else 'n/a')}\n{clog3[-400:]}")
-        if ok1 and ok2 and not admitted:
+                  f"dev3 conn={ok3}/{ip3} net={(n3.status.value if n3 else 'n/a')} | {sig}\n{clog3[-400:]}")
+        if ok1 and ok2 and not admitted and refused:
             rj.status = Status.PASS
-            rj.detail = f"2 devices up; 3rd refused (conn={ok3}, net={n3.status.value if n3 else 'n/a'})"
+            rj.detail = f"2 devices up; 3rd actively refused [{sig}]"
         else:
             rj.status = Status.FAIL
-            rj.detail = f"expected 3rd refused; dev1={ok1} dev2={ok2} dev3_admitted={admitted}"
+            rj.detail = f"expected 3rd actively refused; dev1={ok1} dev2={ok2} admitted={admitted} {sig}"
     except Exception as e:  # noqa: BLE001
         rj.status, rj.detail = Status.ERROR, str(e)[:150]
     log(f"-> strategy-reject [{rj.status.value}] {rj.detail}")
@@ -461,8 +489,28 @@ def _strategy_check(proto, cA, cB, cC, sc, ib, panel, log, phase, server_exec=No
                     server_evicted = "evicted oldest device" in (ev or "")
                 except Exception:  # noqa: BLE001
                     pass
-            evicted = dropped["v"] or server_evicted
-            evwhy = f"dev1 tunnel dropped={dropped['v']} server-evicted={server_evicted}"
+            # Causative corroboration: eviction tears down the victim's ppp link on the
+            # SERVER (killPPPByIP deletes the interface whose peer is dev1's IP), so that
+            # IP must no longer be present on any server ppp interface. This is a
+            # churn-proof data-plane fact — unlike the log line alone (which could fire
+            # without the link dropping) or the race-prone client-side poll.
+            link_gone = None
+            if server_exec is not None and ip1:
+                try:
+                    _, addrs, _ = server_exec(
+                        "ip -o addr show 2>/dev/null | grep 'peer %s/' || true" % ip1)
+                    link_gone = (addrs or "").strip() == ""
+                except Exception:  # noqa: BLE001
+                    pass
+            # Pass requires the eviction to have actually happened: the log line AND,
+            # when we can check it, the victim's server-side link being gone. The
+            # client-side drop is the fallback only when no server signal is available.
+            if server_exec is not None:
+                evicted = server_evicted and (link_gone is not False)
+            else:
+                evicted = dropped["v"]
+            evwhy = (f"dev1 dropped(client)={dropped['v']} server-evicted={server_evicted} "
+                     f"link_gone={link_gone}")
         ac.log = (f"dev1={ok1}/{ip1} dev2={ok2}/{ip2}\n"
                   f"dev3 conn={ok3}/{ip3}\n{evwhy}\n{clog3[-400:]}")
         if ok1 and ok2 and ok3 and evicted:

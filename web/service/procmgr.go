@@ -195,6 +195,11 @@ func (p *managedProc) supervise(cmd *exec.Cmd, gen int) {
 			return
 		}
 		p.gen++
+		// Reap the crashed process's orphaned group (e.g. xl2tpd/pptpd's pppd children,
+		// which survive the parent's death and would otherwise wedge a fresh daemon —
+		// the "says running but not working" state that only a manual restart cleared).
+		// Start() does this before every launch; the auto-restart must too.
+		p.terminateLocked()
 		_ = p.launchLocked()
 	}()
 }

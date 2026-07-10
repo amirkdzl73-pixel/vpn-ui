@@ -309,6 +309,47 @@ func (s *XrayService) translateVpnRoutingRules(config *xray.Config) {
 		}
 	}
 
+	// Backstop: block any VPN tunnel source that isn't a valid account device IP.
+	// nftables TPROXYs the WHOLE client /24 into Xray, and with no matching rule a
+	// packet falls through to Xray's default (first) outbound — so a device holding an
+	// in-/24 but out-of-block IP (an over-limit device, a failed eviction, or a keyless
+	// Access-Accept fallback) would otherwise reach the internet, making the User Limit
+	// cap cosmetic. We list every legitimate device IP -> the default outbound, then
+	// blackhole the rest of the VPN space. Appended last, so operator per-account rules
+	// still take precedence for valid IPs; only unrecognized (over-limit / leaked)
+	// sources hit the blackhole. Tags are taken from the config's own outbounds so the
+	// default egress is preserved and the backstop is skipped when no blackhole exists.
+	defaultTag, blockTag := "direct", ""
+	var obs []map[string]any
+	if json.Unmarshal(config.OutboundConfigs, &obs) == nil {
+		for i, ob := range obs {
+			t, _ := ob["tag"].(string)
+			if i == 0 && t != "" {
+				defaultTag = t
+			}
+			if p, _ := ob["protocol"].(string); p == "blackhole" && t != "" {
+				blockTag = t
+			}
+		}
+	}
+	var validIPs []any
+	seen := make(map[string]bool)
+	for _, ips := range vpnMap {
+		for _, ip := range ips {
+			if ip != "" && !seen[ip] {
+				seen[ip] = true
+				validIPs = append(validIPs, ip)
+			}
+		}
+	}
+	if blockTag != "" && len(validIPs) > 0 {
+		newRules = append(newRules,
+			map[string]any{"type": "field", "source": validIPs, "outboundTag": defaultTag},
+			map[string]any{"type": "field", "source": []any{vpnAddrSpace}, "outboundTag": blockTag},
+		)
+		modified = true
+	}
+
 	if !modified {
 		return
 	}

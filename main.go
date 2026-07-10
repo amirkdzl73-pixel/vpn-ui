@@ -829,6 +829,18 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 	mask := parts[0]
 	candidates := parts[1:]
 
+	// Serialize concurrent client-connect hooks for this inbound+proto. They run as
+	// separate short-lived processes sharing the lease dir, so without a lock two
+	// devices dialing at once can both read the block as free and lease the SAME IP
+	// (an over-admit / duplicate-IP race). An exclusive flock makes the whole
+	// read-decide-write below atomic across hooks; it releases when this process exits.
+	if lf, lerr := os.OpenFile(filepath.Join(dir, "connect-"+proto+".lock"), os.O_CREATE|os.O_RDWR, 0644); lerr == nil {
+		defer lf.Close()
+		if syscall.Flock(int(lf.Fd()), syscall.LOCK_EX) == nil {
+			defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		}
+	}
+
 	statusPath := fmt.Sprintf("/var/run/openvpn/status-%d-%s.log", inboundId, proto)
 	liveStatus := ovpnStatusIPs(statusPath) // devices OpenVPN currently reports connected
 	inUse := make(map[string]bool, len(liveStatus))
@@ -856,17 +868,46 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 		}
 	}
 
+	// User Limit K is per ACCOUNT, not per transport. Count this transport's occupied
+	// block slots PLUS the account's devices on the OTHER transport (which draws on the
+	// same K budget), so an account that enables both udp and tcp can't run K devices on
+	// each for 2*K total. The other transport is only consulted when its block exists.
+	usedCount := 0
 	for _, ip := range candidates {
 		if inUse[ip] {
-			continue
+			usedCount++
 		}
-		_ = os.WriteFile(filepath.Join(leaseDir, ip), []byte(username), 0644)
-		return ip, mask, false
+	}
+	otherProto := "tcp"
+	if proto == "tcp" {
+		otherProto = "udp"
+	}
+	if oData, oErr := os.ReadFile(filepath.Join(dir, "blocks-"+otherProto, username)); oErr == nil {
+		if oIPs := strings.Fields(strings.TrimSpace(string(oData))); len(oIPs) >= 2 {
+			oStatus := ovpnStatusIPs(fmt.Sprintf("/var/run/openvpn/status-%d-%s.log", inboundId, otherProto))
+			oLease := ovpnLeasedIPs(filepath.Join(dir, "leases-"+otherProto))
+			for _, ip := range oIPs[1:] { // skip the mask
+				if oStatus[ip] || oLease[ip] {
+					usedCount++
+				}
+			}
+		}
 	}
 
-	// The block is full by LEASE count — but a gap-lease can outlive its device by up
-	// to 30s, so "full" may be an illusion. "accept": admit by reusing an IP; "reject":
-	// refuse (unchanged — a live device cap is enforced by the lease count).
+	// (1) A free slot for this new device — only while the account is under K in total.
+	if usedCount < len(candidates) {
+		for _, ip := range candidates {
+			if inUse[ip] {
+				continue
+			}
+			ovpnWriteLease(leaseDir, ip, poolIP)
+			return ip, mask, false
+		}
+	}
+
+	// The block is full — but a gap-lease can outlive its device by up to 30s, so "full"
+	// may be an illusion. "accept": admit by reclaiming a ghost or evicting the oldest
+	// live device; "reject" (default): refuse.
 	if ovpnReadStrategy(dir, proto) == "accept" {
 		// Prefer reclaiming a slot pinned ONLY by a stale gap-lease (an abandoned dial)
 		// over evicting a live device — and never self-evict. A ghost = a lease older
@@ -885,7 +926,7 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 			}
 		}
 		if ghostIP != "" {
-			_ = os.WriteFile(filepath.Join(leaseDir, ghostIP), []byte(username), 0644)
+			ovpnWriteLease(leaseDir, ghostIP, poolIP)
 			return ghostIP, mask, false
 		}
 
@@ -895,17 +936,84 @@ func ovpnLeaseBlockIP(inboundId int, username, poolIP string) (string, string, b
 		// helper. Killing by the pre-captured real address hits the OLD device.
 		victimIP, victimRAddr := ovpnOldestFromStatus(statusPath, candidates)
 		if victimIP == "" {
-			// No live device in the status and no reclaimable ghost — every slot is a
-			// fresh lease mid-handshake. Reuse the first slot WITHOUT an evictor (there
-			// is nothing live to kill, and spawning one would evict this new client).
-			_ = os.WriteFile(filepath.Join(leaseDir, candidates[0]), []byte(username), 0644)
-			return candidates[0], mask, false
+			// The block is full by leases, but no device is in the (up to 5s-stale)
+			// status file yet, so it can't name a victim. Fall back to the OLDEST
+			// gap-lease and let the detached evictor kill whoever holds that IP via the
+			// LIVE management socket (openvpn-evict queries `status 3` when given no real
+			// address). WITHOUT this, "accept" wrongly behaved like "reject" for any
+			// device dialing within ~5s of the incumbents (the status hadn't flushed, so
+			// the eviction never fired) — the "accept always rejects" bug.
+			victimIP = oldestLeasedIP(leaseAge)
+			if victimIP == "" {
+				return "", "", true // genuinely nothing leased to reuse — refuse
+			}
 		}
 		ovpnSpawnEvict(inboundId, proto, victimIP, victimRAddr)
-		_ = os.WriteFile(filepath.Join(leaseDir, victimIP), []byte(username), 0644)
+		ovpnWriteLease(leaseDir, victimIP, poolIP)
 		return victimIP, mask, false
 	}
 	return "", "", true // reject the new device
+}
+
+// oldestLeasedIP returns the block IP holding the oldest gap-lease (the account's
+// longest-connected device — the "accept" eviction victim when the status file is too
+// stale to name one), or "" when there are no leases.
+func oldestLeasedIP(leaseAge map[string]time.Duration) string {
+	var ip string
+	oldest := time.Duration(-1)
+	for k, age := range leaseAge {
+		if age > oldest {
+			oldest, ip = age, k
+		}
+	}
+	return ip
+}
+
+// ovpnWriteLease records a gap-lease file named by the leased block IP, storing the
+// device's pool IP as content so the disconnect hook can find and free it by pool IP.
+func ovpnWriteLease(leaseDir, blockIP, poolIP string) {
+	_ = os.WriteFile(filepath.Join(leaseDir, blockIP), []byte(poolIP), 0644)
+}
+
+// ovpnLeasedIPs returns the set of block IPs currently gap-leased in a transport's
+// lease dir (fresh leases only; entries past the 30s TTL are ignored). Used to count
+// the other transport's occupancy toward the shared per-account K budget.
+func ovpnLeasedIPs(leaseDir string) map[string]bool {
+	set := map[string]bool{}
+	entries, err := os.ReadDir(leaseDir)
+	if err != nil {
+		return set
+	}
+	now := time.Now()
+	for _, ent := range entries {
+		fi, e := os.Stat(filepath.Join(leaseDir, ent.Name()))
+		if e != nil || now.Sub(fi.ModTime()) > 30*time.Second {
+			continue
+		}
+		set[ent.Name()] = true
+	}
+	return set
+}
+
+// ovpnRemoveLeaseByPool removes the gap-lease held by the device with this pool IP
+// (leases are named by block IP with the pool IP as content) and returns the leased
+// block IP, or "" if none matches. Called on client-disconnect so the slot frees
+// immediately instead of lingering until the lease TTL, and so the Acct-Stop can be
+// keyed by the same leased IP the connect hook used.
+func ovpnRemoveLeaseByPool(leaseDir, poolIP string) string {
+	entries, err := os.ReadDir(leaseDir)
+	if err != nil {
+		return ""
+	}
+	for _, ent := range entries {
+		p := filepath.Join(leaseDir, ent.Name())
+		content, e := os.ReadFile(p)
+		if e == nil && strings.TrimSpace(string(content)) == poolIP {
+			_ = os.Remove(p)
+			return ent.Name()
+		}
+	}
+	return ""
 }
 
 // ovpnReadStrategy returns the inbound's User Limit Strategy ("accept", else the
@@ -1053,7 +1161,7 @@ func ovpnStatusIPs(statusPath string) map[string]bool {
 	// A complete status ends with an "END" line — read a few times until we see one,
 	// and union every read's rows so a partial snapshot can only ADD, never drop, a
 	// device (a more-complete "used" set is always the safe direction).
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 8; attempt++ {
 		data, err := os.ReadFile(statusPath)
 		if err != nil {
 			break
@@ -1075,7 +1183,7 @@ func ovpnStatusIPs(statusPath string) map[string]bool {
 		if complete {
 			break // got a whole snapshot — trustworthy
 		}
-		time.Sleep(5 * time.Millisecond) // landed mid-rewrite; let it finish, retry
+		time.Sleep(10 * time.Millisecond) // landed mid-rewrite; let it finish, retry
 	}
 	return set
 }
@@ -1153,6 +1261,19 @@ func openvpnDisconnect() {
 
 	if username == "" || ip == "" {
 		os.Exit(0)
+	}
+
+	// Free this device's block gap-lease immediately (leases are named by block IP,
+	// keyed by the pool IP) so the slot reopens now instead of at the lease TTL, and
+	// recover the leased block IP so this Acct-Stop's session-id matches the Acct-Start
+	// the connect hook sent (which used the leased IP, not the pool IP).
+	proto := "udp"
+	if strings.HasPrefix(ip, "10.3.") {
+		proto = "tcp"
+	}
+	leaseDir := filepath.Join(fmt.Sprintf("/etc/openvpn/server-%d", inboundId), "leases-"+proto)
+	if leased := ovpnRemoveLeaseByPool(leaseDir, ip); leased != "" {
+		ip = leased
 	}
 
 	secret := readRadiusSecret()
