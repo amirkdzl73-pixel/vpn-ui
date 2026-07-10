@@ -94,6 +94,44 @@ func writeClientToClientRules(b *strings.Builder, subnets []string, enabled bool
 	}
 }
 
+// vpnNet is one enabled VPN inbound's client address space plus its inter-client
+// reachability toggles, used to build the cross-inbound rules. OpenVPN carries
+// both its UDP and TCP block CIDRs.
+type vpnNet struct {
+	subnets []string // CIDRs, e.g. "10.0.5.0/24"
+	c2c     bool     // Client to Client
+	cross   bool     // Cross Inbound (UI-gated behind Client to Client)
+}
+
+// writeCrossInboundRules emits, for every pair of DIFFERENT inbounds, the verdict
+// governing whether one inbound's client may reach another's: accept when BOTH
+// opted into Cross Inbound (which requires Client to Client), drop otherwise.
+//
+// The drop is load-bearing: it sits before the per-inbound TPROXY rules, so a
+// non-opted pair is dropped in the kernel instead of falling through to the
+// sender's TPROXY rule, entering Xray, and being delivered to the peer by Xray's
+// freedom outbound (both clients are local to this host) — which would bridge the
+// two inbounds no matter how Cross Inbound is set. Same-inbound pairs are skipped
+// here; they are governed by that inbound's own writeClientToClientRules.
+func writeCrossInboundRules(b *strings.Builder, nets []vpnNet) {
+	for ai, a := range nets {
+		for bi, bnet := range nets {
+			if ai == bi {
+				continue
+			}
+			verdict := "drop"
+			if a.cross && a.c2c && bnet.cross && bnet.c2c {
+				verdict = "accept"
+			}
+			for _, sa := range a.subnets {
+				for _, dst := range bnet.subnets {
+					b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s ip daddr %s %s\n", sa, dst, verdict))
+				}
+			}
+		}
+	}
+}
+
 // ApplyNftRules regenerates and atomically loads the nftables config for all VPN inbounds.
 // Static chains (prerouting/postrouting/input) are flushed and rebuilt.
 // Accounting chains (l2tp_acct/pptp_acct) are NEVER flushed — their dynamic per-client
@@ -154,16 +192,8 @@ func (s *NftService) ApplyNftRules() error {
 
 	// --- Cross-inbound pass (mutual opt-in) --------------------------------
 	// Gather every enabled VPN inbound's client subnet(s) plus its Client-to-
-	// Client / Cross-Inbound toggles, then allow forwarding between any two
-	// DIFFERENT inbounds that BOTH opted in (Cross Inbound requires Client to
-	// Client). These accepts sit before the TPROXY rules, so cross-inbound
-	// traffic is kernel-forwarded straight to the peer instead of being
-	// redirected into Xray (which would apply the peer's routing/outbounds).
-	type vpnNet struct {
-		subnets []string // CIDRs, e.g. "10.0.5.0/24"
-		c2c     bool
-		cross   bool
-	}
+	// Client / Cross-Inbound toggles; writeCrossInboundRules then accepts or drops
+	// each inter-inbound pair. See that function for why the drop is load-bearing.
 	var allNets []vpnNet
 	for _, inbound := range l2tpInbounds {
 		if !inbound.Enable {
@@ -195,21 +225,7 @@ func (s *NftService) ApplyNftRules() error {
 		}
 		allNets = append(allNets, vpnNet{subnets: ovpnCIDRs(inbound, st), c2c: st.ClientToClient, cross: st.CrossInbound})
 	}
-	for ai, a := range allNets {
-		if !a.cross || !a.c2c {
-			continue
-		}
-		for bi, bnet := range allNets {
-			if ai == bi || !bnet.cross || !bnet.c2c {
-				continue
-			}
-			for _, sa := range a.subnets {
-				for _, dst := range bnet.subnets {
-					b.WriteString(fmt.Sprintf("add rule ip vpn prerouting ip saddr %s ip daddr %s accept\n", sa, dst))
-				}
-			}
-		}
-	}
+	writeCrossInboundRules(&b, allNets)
 
 	// L2TP TPROXY rules
 	for _, inbound := range l2tpInbounds {
