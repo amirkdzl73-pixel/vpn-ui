@@ -22,6 +22,8 @@ defaultroute
 replacedefaultroute
 usepeerdns
 connect-delay 5000
+lcp-echo-interval 15
+lcp-echo-failure 8
 name @@USER@@
 password @@PASS@@
 """

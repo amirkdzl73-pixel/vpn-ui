@@ -18,6 +18,8 @@ require-mschap-v2
 noauth
 persist
 maxfail 3
+lcp-echo-interval 15
+lcp-echo-failure 8
 defaultroute
 replacedefaultroute
 usepeerdns
