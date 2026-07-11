@@ -13,17 +13,18 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 )
 
-// VPN client IP addressing lives in three protocol /16s so cross-protocol
+// VPN client IP addressing lives in per-protocol /16s so cross-protocol
 // collisions are impossible by construction:
 //
 //	L2TP        -> 10.0.0.0/16
 //	PPTP        -> 10.1.0.0/16
 //	OpenVPN UDP -> 10.2.0.0/16  (TCP mirrors into 10.3.0.0/16)
+//	OpenConnect -> 10.4.0.0/16  (single network, no mirror)
 //
 // Within a protocol, each inbound owns whole /24s; no two inbounds may share a
 // /24. L2TP/PPTP inbounds may own an arbitrary list of /24 ranges (grown on
-// demand); OpenVPN owns one contiguous, aligned power-of-two block per transport
-// (its single `server` directive needs a contiguous CIDR).
+// demand); OpenVPN and OpenConnect own one contiguous, aligned power-of-two block
+// (their single `server`/`ipv4-network` directive needs a contiguous CIDR).
 //
 // This file holds the protocol-agnostic range math + the allocator/validator
 // (normalizeRanges) shared by the services, RADIUS, nftables, and the controller.
@@ -139,6 +140,9 @@ func protocolBase(proto string) int {
 		return 1
 	case "openvpn":
 		return 2
+	// 3 is OpenVPN's TCP mirror (mirrorOvpnSubnet), not a protocol of its own.
+	case "openconnect":
+		return 4
 	default: // l2tp
 		return 0
 	}
@@ -270,7 +274,7 @@ func usedVpnSubnets(excludeId int) map[string]bool {
 		return used
 	}
 	var inbounds []*model.Inbound
-	db.Where("protocol IN ?", []string{"l2tp", "pptp", "openvpn"}).Find(&inbounds)
+	db.Where("protocol IN ?", []string{"l2tp", "pptp", "openvpn", "openconnect"}).Find(&inbounds)
 	for _, ib := range inbounds {
 		if ib.Id == excludeId {
 			continue
@@ -349,7 +353,7 @@ func AutoExpandVpnRanges(protocol string) {
 // re-allocated rather than rejected on conflict.
 func normalizeRanges(inbound *model.Inbound, excludeId int) error {
 	proto := string(inbound.Protocol)
-	if proto != "l2tp" && proto != "pptp" && proto != "openvpn" {
+	if proto != "l2tp" && proto != "pptp" && proto != "openvpn" && proto != "openconnect" {
 		return nil
 	}
 
@@ -370,9 +374,14 @@ func normalizeRanges(inbound *model.Inbound, excludeId int) error {
 
 	var normalized []string
 	var err error
-	if proto == "openvpn" {
+	switch proto {
+	case "openvpn":
 		normalized, err = normalizeOvpnRanges(inbound.Id, clientCount, userLimit, used)
-	} else {
+	case "openconnect":
+		// Same aligned-block model as OpenVPN (single contiguous CIDR) but in the
+		// 10.4 /16 with no TCP mirror.
+		normalized, err = normalizeBlockRanges(inbound.Id, clientCount, userLimit, protocolBase("openconnect"), -1, used)
+	default:
 		normalized, err = normalizePppRanges(proto, ranges, clientCount, userLimit, used)
 	}
 	if err != nil {
@@ -384,7 +393,7 @@ func normalizeRanges(inbound *model.Inbound, excludeId int) error {
 	delete(raw, "ipRange") // superseded by ipRanges
 
 	// L2TP/PPTP: keep localIp in sync with the first range's .1 (the PPP gateway).
-	if proto != "openvpn" && len(normalized) > 0 {
+	if proto != "openvpn" && proto != "openconnect" && len(normalized) > 0 {
 		if s, _, ok := parseRange(normalized[0]); ok {
 			lb, _ := json.Marshal(fmt.Sprintf("%d.%d.%d.1", s[0], s[1], s[2]))
 			raw["localIp"] = lb
@@ -450,8 +459,19 @@ func normalizePppRanges(proto string, ranges []string, clientCount, userLimit in
 // normalizeOvpnRanges (re)allocates a contiguous, aligned power-of-two block of
 // /24s for an OpenVPN inbound large enough for clientCount. For <=253 clients it
 // yields the single legacy /24 (10.2.{id}) whenever that /24 is free, keeping
-// existing deployments byte-identical.
+// existing deployments byte-identical. Thin wrapper over normalizeBlockRanges in
+// the OpenVPN /16 (base 10.2) with its TCP mirror (10.3).
 func normalizeOvpnRanges(inboundId, clientCount, userLimit int, used map[string]bool) ([]string, error) {
+	return normalizeBlockRanges(inboundId, clientCount, userLimit, 2, 3, used)
+}
+
+// normalizeBlockRanges (re)allocates a contiguous, aligned power-of-two block of
+// /24s in the 10.{base} /16 for a single-CIDR VPN protocol (OpenVPN, OpenConnect)
+// large enough for clientCount. mirrorBase is a paired /16 whose matching /24s
+// must also stay free (OpenVPN's TCP mirror, 3), or -1 for none. For <=253 clients
+// it yields the single legacy /24 (10.{base}.{id}) whenever free, so existing
+// inbounds stay byte-identical.
+func normalizeBlockRanges(inboundId, clientCount, userLimit, base, mirrorBase int, used map[string]bool) ([]string, error) {
 	needed := clientCount
 	if needed < 1 {
 		needed = 1
@@ -466,27 +486,31 @@ func normalizeOvpnRanges(inboundId, clientCount, userLimit int, used map[string]
 	if num24 > 64 {
 		num24 = 64 // cap the block at a /18 (16k+ hosts)
 	}
-	thirds, ok := allocateAlignedBlock(inboundId, num24, used)
+	thirds, ok := allocateAlignedBlock(inboundId, num24, base, mirrorBase, used)
 	if !ok {
-		return nil, fmt.Errorf("no free aligned block of %d /24s available for OpenVPN", num24)
+		return nil, fmt.Errorf("no free aligned block of %d /24s available in 10.%d.0.0/16", num24, base)
 	}
 	out := make([]string, 0, len(thirds))
 	for _, t := range thirds {
-		out = append(out, ovpnRangeForSubnet(fmt.Sprintf("10.2.%d", t)))
+		out = append(out, ovpnRangeForSubnet(fmt.Sprintf("10.%d.%d", base, t)))
 	}
 	return out, nil
 }
 
 // allocateAlignedBlock finds num24 consecutive, aligned free /24 third-octets in
-// the OpenVPN /16, preferring the aligned block that contains the inbound id.
-// Both the UDP (10.2.x) and mirrored TCP (10.3.x) slots must be free.
-func allocateAlignedBlock(id, num24 int, used map[string]bool) ([]int, bool) {
+// the 10.{base} /16, preferring the aligned block that contains the inbound id.
+// The base slot (10.{base}.x) and, when mirrorBase >= 0, the mirror slot
+// (10.{mirrorBase}.x) must both be free.
+func allocateAlignedBlock(id, num24, base, mirrorBase int, used map[string]bool) ([]int, bool) {
 	free := func(n int) bool {
 		if n < 0 || n+num24-1 > 254 {
 			return false
 		}
 		for t := n; t < n+num24; t++ {
-			if used[fmt.Sprintf("10.2.%d", t)] || used[fmt.Sprintf("10.3.%d", t)] {
+			if used[fmt.Sprintf("10.%d.%d", base, t)] {
+				return false
+			}
+			if mirrorBase >= 0 && used[fmt.Sprintf("10.%d.%d", mirrorBase, t)] {
 				return false
 			}
 		}

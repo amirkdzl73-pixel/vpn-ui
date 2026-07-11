@@ -2,6 +2,7 @@ package service
 
 import (
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +106,31 @@ func TestNormalizeOvpnRangesLegacyIdentity(t *testing.T) {
 	tcpNet, _ := ovpnBlock(got, "tcp", 7)
 	if tcpNet.String() != "10.3.7.0" {
 		t.Errorf("tcp mirror = %s want 10.3.7.0", tcpNet)
+	}
+}
+
+func TestNormalizeBlockRangesOpenconnect(t *testing.T) {
+	// OpenConnect lives in 10.4 /16 with no TCP mirror. <=253 clients on inbound
+	// id 7 -> single 10.4.7 /24; the 10.3 mirror slot must NOT be reserved.
+	got, err := normalizeBlockRanges(7, 50, 1, protocolBase("openconnect"), -1, map[string]bool{})
+	if err != nil {
+		t.Fatalf("err %v", err)
+	}
+	if len(got) != 1 || rangeSubnet(got[0]) != "10.4.7" {
+		t.Errorf("openconnect block = %v want single 10.4.7", got)
+	}
+	// 300 clients -> aligned /23 in 10.4, still no mirror constraint.
+	grown, err := normalizeBlockRanges(8, 300, 1, protocolBase("openconnect"), -1, map[string]bool{})
+	if err != nil {
+		t.Fatalf("err %v", err)
+	}
+	if len(grown) != 2 {
+		t.Fatalf("expected 2 /24s, got %v", grown)
+	}
+	for _, r := range grown {
+		if !strings.HasPrefix(rangeSubnet(r), "10.4.") {
+			t.Errorf("openconnect range %q not in 10.4/16", r)
+		}
 	}
 }
 

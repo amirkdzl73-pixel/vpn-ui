@@ -14,10 +14,12 @@ import (
 
 const nftConfigFile = "/etc/vpn-ui/vpn.nft"
 
-// vpnAddrSpace is the covering /14 for the four protocol /16s VPN clients live in
-// (10.0/16 L2TP, 10.1 PPTP, 10.2/10.3 OpenVPN — see vpnrange.go). Trusting the
-// whole /14 in firewalld covers every current and future auto-expanded /24.
-const vpnAddrSpace = "10.0.0.0/14"
+// vpnAddrSpace is the covering /13 (10.0.0.0-10.7.255.255) for the protocol /16s
+// VPN clients live in (10.0 L2TP, 10.1 PPTP, 10.2/10.3 OpenVPN, 10.4 OpenConnect —
+// see vpnrange.go). Trusting the whole /13 in firewalld + using it as the routing
+// blackhole backstop covers every current and future auto-expanded /24. It must
+// stay a superset of every protocolBase /16, so widen it when adding protocols.
+const vpnAddrSpace = "10.0.0.0/13"
 
 // NftService manages nftables rules for L2TP, PPTP, and OpenVPN traffic accounting, TPROXY, and NAT.
 type NftService struct{}
