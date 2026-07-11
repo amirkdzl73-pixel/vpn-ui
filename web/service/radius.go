@@ -574,23 +574,31 @@ func (s *RadiusService) CleanStaleSessions() {
 	s.mu.Unlock()
 }
 
-// isIPActive checks if a PPP client IP is still assigned to an interface.
+// isIPActive checks if a VPN client IP is still reachable through its tunnel.
 func (s *RadiusService) isIPActive(ip string, protocol string) bool {
-	// For L2TP/PPTP: check if the IP is assigned to a local PPP interface
-	if protocol != "openvpn" {
+	switch protocol {
+	case "openvpn":
+		// A route to the IP exists through OpenVPN's tun device.
+		output, err := exec.Command("ip", "route", "get", ip).Output()
+		if err != nil {
+			return false // no route = not active
+		}
+		return strings.Contains(string(output), "tun-ovpn")
+	case "openconnect":
+		// ocserv client IPs are peers on the ocserv tun (not local addrs), so check
+		// for a route through an ocserv device rather than scanning `ip addr show`.
+		output, err := exec.Command("ip", "route", "get", ip).Output()
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(output), "ocserv")
+	default: // l2tp / pptp: the IP is assigned to a local PPP interface
 		output, err := exec.Command("ip", "-o", "addr", "show").Output()
 		if err != nil {
 			return true // assume active on error
 		}
 		return strings.Contains(string(output), ip)
 	}
-
-	// For OpenVPN: check if a route to the IP exists through a tun device
-	output, err := exec.Command("ip", "route", "get", ip).Output()
-	if err != nil {
-		return false // no route = not active
-	}
-	return strings.Contains(string(output), "tun-ovpn")
 }
 
 // parseNASIdentifier extracts protocol and inbound ID from a NAS-Identifier.
@@ -601,7 +609,7 @@ func (s *RadiusService) isIPActive(ip string, protocol string) bool {
 //     protocol on its single fixed port, so it can carry only ONE NAS-Identifier.
 //   - per-inbound, e.g. "l2tp-3" / "pptp-5": kept for backward compatibility.
 func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error) {
-	if nasID == "l2tp" || nasID == "pptp" || nasID == "openvpn" {
+	if nasID == "l2tp" || nasID == "pptp" || nasID == "openvpn" || nasID == "openconnect" {
 		return nasID, 0, nil
 	}
 
@@ -611,7 +619,7 @@ func parseNASIdentifier(nasID string) (protocol string, inboundId int, err error
 	}
 
 	protocol = parts[0]
-	if protocol != "l2tp" && protocol != "pptp" && protocol != "openvpn" {
+	if protocol != "l2tp" && protocol != "pptp" && protocol != "openvpn" && protocol != "openconnect" {
 		return "", 0, fmt.Errorf("unknown protocol in NAS-Identifier: %s", protocol)
 	}
 
@@ -855,7 +863,13 @@ func (s *RadiusService) allocateBlockIP(inboundId, clientIndex int, blockIPs []s
 		if victimSID, victimIP := oldestBlockSession(s.sessions, blockSet); victimIP != "" {
 			delete(s.sessions, victimSID)
 			s.nftService.RemoveClientAccounting(protocol, victimIP)
-			killPPPByIP(victimIP) // force the old device's ppp link down
+			// Force the old device's link down. L2TP/PPTP delete the ppp interface;
+			// ocserv has no ppp iface, so disconnect the session via occtl instead.
+			if protocol == "openconnect" {
+				killOcservByIP(inboundId, victimIP)
+			} else {
+				killPPPByIP(victimIP)
+			}
 			logger.Infof("RADIUS: user-limit accept — evicted oldest device ip=%s proto=%s to admit new device", victimIP, protocol)
 			return assign(victimIP)
 		}
@@ -954,9 +968,12 @@ func BuildVpnEmailToIPMap() map[string][]string {
 		Email string `json:"email"`
 	}
 
-	// --- L2TP / PPTP: single IP from the ppp ip-range ---
+	// --- L2TP / PPTP / OpenConnect: single-network block, one IP (or K device IPs)
+	// per account. OpenConnect shares this model (contiguous 10.4 block, no mirror);
+	// its per-index/per-block IPs come out of computeVpnClientIP/vpnAccountDeviceIPs
+	// keyed on protocolBase("openconnect")=4, identical to the ppp path. ---
 	var pppInbounds []*model.Inbound
-	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp"}, true).Find(&pppInbounds)
+	db.Where("protocol IN ? AND enable = ?", []string{"l2tp", "pptp", "openconnect"}, true).Find(&pppInbounds)
 
 	type pppSettingsJSON struct {
 		IpRanges  []string      `json:"ipRanges"`

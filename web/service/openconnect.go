@@ -505,6 +505,36 @@ func (s *OcservService) occtlSocket(inboundId int) string {
 	return fmt.Sprintf("/var/run/ocserv/occtl-%d.sock", inboundId)
 }
 
+// killOcservByIP force-disconnects the ocserv session holding tunnel IP `ip` on the
+// given inbound, via occtl. It is the OpenConnect analogue of killPPPByIP (used by
+// the User-Limit "accept" eviction in radius.go): occtl has no disconnect-by-IP, so
+// it lists sessions (`show users -j`), finds the one whose assigned IPv4 matches,
+// and disconnects it by session id. Best-effort; any error is ignored.
+func killOcservByIP(inboundId int, ip string) {
+	sock := fmt.Sprintf("/var/run/ocserv/occtl-%d.sock", inboundId)
+	if _, err := os.Stat(sock); err != nil {
+		return
+	}
+	bin := daemonBin("occtl")
+	out, err := exec.Command(bin, "-s", sock, "-j", "show", "users").Output()
+	if err != nil {
+		return
+	}
+	var users []struct {
+		ID   json.Number `json:"ID"`
+		IPv4 string      `json:"IPv4"`
+	}
+	if err := json.Unmarshal(out, &users); err != nil {
+		return
+	}
+	for _, u := range users {
+		if u.IPv4 == ip {
+			_ = exec.Command(bin, "-s", sock, "disconnect", "id", u.ID.String()).Run()
+			return
+		}
+	}
+}
+
 // KillClient disconnects a user's active session(s) on an inbound's ocserv via
 // occtl. Best-effort: a no-op if the socket/daemon isn't up. `disconnect user`
 // drops every session for that username (whole-account teardown), which is what
