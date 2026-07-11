@@ -270,6 +270,10 @@ class Panel:
         """Returns {caCert,caKey,serverCert,serverKey,tlsCrypt}."""
         return self._post("/panel/api/inbounds/generate-openvpn-certs", {}).get("obj", {})
 
+    def generate_ocserv_cert(self) -> dict:
+        """Returns {certificate, key} — a self-signed server cert for OpenConnect."""
+        return self._post("/panel/api/inbounds/generate-ocserv-cert", {}).get("obj", {})
+
     def download_ovpn(self, inbound_id: int, proto: str) -> str:
         """proto in {udp,tcp}. Returns raw .ovpn text."""
         r = self.s.get(self._url(f"/panel/api/inbounds/{inbound_id}/ovpn/{proto}"),

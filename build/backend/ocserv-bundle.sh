@@ -106,8 +106,16 @@ make -j"$(nproc)"
 
 mkdir -p /out
 cp src/ocserv /out/ocserv
+# ocserv is multi-process: the main daemon exec()s a SEPARATE ocserv-worker binary
+# for every connection, resolved next to the main binary. Without it, ocserv binds
+# its ports but drops every handshake ("exec ocserv-worker failed"). Ship both; they
+# get extracted side by side into backend/bin.
+cp src/ocserv-worker /out/ocserv-worker
 cp src/occtl/occtl /out/occtl 2>/dev/null || cp src/occtl /out/occtl 2>/dev/null || true
-strip /out/ocserv /out/occtl 2>/dev/null || true
+strip /out/ocserv /out/ocserv-worker /out/occtl 2>/dev/null || true
+
+echo "== ocserv-worker (static?) =="
+file /out/ocserv-worker
 
 echo "== ocserv built =="
 file /out/ocserv

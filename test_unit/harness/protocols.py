@@ -14,19 +14,23 @@ from . import traffic
 from .clients import openvpn as ovpn
 from .clients import l2tp as l2tp_mod
 from .clients import pptp as pptp_mod
+from .clients import openconnect as oc_mod
 from .clients.base import Client
 from .model import Phase, SubTest, Status
-from .model import PHASE_OPENVPN, PHASE_L2TP, PHASE_PPTP
+from .model import PHASE_OPENVPN, PHASE_L2TP, PHASE_PPTP, PHASE_OPENCONNECT
 
 # cross-inbound peer: X's cross test pings a client on peer[X]'s inbound
-PEER = {"openvpn": "l2tp", "l2tp": "pptp", "pptp": "openvpn"}
-PHASE = {"openvpn": PHASE_OPENVPN, "l2tp": PHASE_L2TP, "pptp": PHASE_PPTP}
+PEER = {"openvpn": "l2tp", "l2tp": "pptp", "pptp": "openvpn",
+        "openconnect": "openvpn"}
+PHASE = {"openvpn": PHASE_OPENVPN, "l2tp": PHASE_L2TP, "pptp": PHASE_PPTP,
+         "openconnect": PHASE_OPENCONNECT}
 
 # Connect variant used when dialing the SECOND same-protocol inbound (TEST 1,
 # _multi_inbound_check): l2tp uses RAW (the client's IPsec config is pinned to the
 # primary's 17/1701, so a 2nd l2tp inbound is exercised over raw L2TP), openvpn
 # udp/new, pptp has no variant.
-_SECOND_VARIANT = {"openvpn": ("udp", "new"), "l2tp": "raw", "pptp": None}
+_SECOND_VARIANT = {"openvpn": ("udp", "new"), "l2tp": "raw", "pptp": None,
+                   "openconnect": "dtls"}
 
 
 def _connect(client: Client, sc, proto: str, which: str, variant=None, ib=None):
@@ -42,13 +46,17 @@ def _connect(client: Client, sc, proto: str, which: str, variant=None, ib=None):
                                 server_ip=sc.server_ip)
     if proto == "pptp":
         return pptp_mod.connect(client, ib, which, server_ip=sc.server_ip)
+    if proto == "openconnect":
+        return oc_mod.connect(client, ib, which, variant=variant or "dtls",
+                              server_ip=sc.server_ip)
     raise ValueError(proto)
 
 
 def _disconnect(client: Client, proto: str):
     {"openvpn": ovpn.disconnect,
      "l2tp": l2tp_mod.disconnect,
-     "pptp": pptp_mod.disconnect}[proto](client)
+     "pptp": pptp_mod.disconnect,
+     "openconnect": oc_mod.disconnect}[proto](client)
 
 
 def _variants(proto: str):
@@ -64,6 +72,11 @@ def _variants(proto: str):
         return [
             ("connect-ipsec", "ipsec", True),
             ("connect-raw", "raw", False),
+        ]
+    if proto == "openconnect":
+        return [
+            ("connect-dtls", "dtls", True),
+            ("connect-tls", "tls", False),
         ]
     return [("connect", None, True)]
 
@@ -362,7 +375,7 @@ def _strategy_check(proto, cA, cB, cC, sc, ib, panel, log, phase, server_exec=No
         client side can't see the drop. Instead assert SERVER-SIDE that the account
         never exceeds K live sessions: the status file's CLIENT_LIST count stays <=K
         when the oldest was evicted, vs 3 (a duplicate) when it was not."""
-    iface = "tun0" if proto == "openvpn" else "ppp0"
+    iface = "tun0" if proto in ("openvpn", "openconnect") else "ppp0"
 
     def all_down():
         for c in (cA, cB, cC):
@@ -554,7 +567,7 @@ def _ovpn_cid_present(rows, cid) -> bool:
 
 
 def _iface_up(client: Client, proto: str) -> bool:
-    iface = "tun0" if proto == "openvpn" else "ppp0"
+    iface = "tun0" if proto in ("openvpn", "openconnect") else "ppp0"
     return bool(client.wait_iface(iface, timeout=3))
 
 

@@ -174,7 +174,7 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	// Parse NAS-Identifier: "l2tp-{id}" or "pptp-{id}"
 	protocol, inboundId, err := parseNASIdentifier(nasID)
 	if err != nil {
-		logger.Debugf("RADIUS: auth rejected — invalid NAS-Identifier %q", nasID)
+		logger.Infof("RADIUS: auth rejected — invalid NAS-Identifier %q", nasID)
 		w.Write(r.Response(radius.CodeAccessReject))
 		return
 	}
@@ -182,28 +182,51 @@ func (s *RadiusService) handleAuth(w radius.ResponseWriter, r *radius.Request) {
 	// Look up the client password from the database
 	password, err := s.lookupClient(protocol, inboundId, username)
 	if err != nil {
-		logger.Debugf("RADIUS: auth rejected — %s user=%s nas=%s", err, username, nasID)
+		logger.Infof("RADIUS: auth rejected — %s user=%s nas=%s", err, username, nasID)
 		w.Write(r.Response(radius.CodeAccessReject))
 		return
 	}
 
-	// PAP authentication (OpenVPN sends plaintext password via User-Password)
+	// PAP authentication. Both OpenVPN's auth hook (`vpn-ui openvpn-auth`) and
+	// OpenConnect (ocserv via radcli) authenticate with a plaintext User-Password.
 	userPassword := rfc2865.UserPassword_GetString(r.Packet)
 	if userPassword != "" {
-		if userPassword == password {
-			accept := r.Response(radius.CodeAccessAccept)
-			logger.Infof("RADIUS: auth accepted (PAP) user=%s nas=%s", username, nasID)
-			w.Write(accept)
-		} else {
-			logger.Debugf("RADIUS: auth rejected (PAP) — wrong password user=%s nas=%s", username, nasID)
+		if userPassword != password {
+			logger.Infof("RADIUS: auth rejected (PAP) — wrong password user=%s nas=%s", username, nasID)
 			w.Write(r.Response(radius.CodeAccessReject))
+			return
 		}
+		accept := r.Response(radius.CodeAccessAccept)
+		// OpenConnect is RADIUS-authoritative for the tunnel IP: ocserv runs with
+		// predictable-ips=false and NO local pool, so it provisions each session from
+		// the Access-Accept's Framed-IP-Address. A keyless accept leaves ocserv with
+		// no IP to assign — the session can't come up and the client sees an auth
+		// failure. This branch therefore mirrors the MS-CHAPv2 path for openconnect:
+		// assign the per-user source IP and apply the User-Limit gate (reject
+		// strategy). OpenVPN assigns IPs via CCD and enforces User Limit in its
+		// connect hook, so it keeps taking the bare accept unchanged.
+		if protocol == "openconnect" {
+			clientIP, deny := s.getClientIP(protocol, inboundId, username, station, nasPort)
+			if deny {
+				logger.Infof("RADIUS: auth rejected — user-limit reached (strategy=reject) user=%s nas=%s", username, nasID)
+				w.Write(r.Response(radius.CodeAccessReject))
+				return
+			}
+			if clientIP != nil {
+				rfc2865.FramedIPAddress_Set(accept, clientIP)
+			}
+			rfc2869.AcctInterimInterval_Set(accept, rfc2869.AcctInterimInterval(60))
+			logger.Infof("RADIUS: auth accepted (PAP) user=%s nas=%s ip=%v", username, nasID, clientIP)
+		} else {
+			logger.Infof("RADIUS: auth accepted (PAP) user=%s nas=%s", username, nasID)
+		}
+		w.Write(accept)
 		return
 	}
 
 	// MS-CHAPv2 authentication
 	if len(challenge) != 16 || len(response) != 50 {
-		logger.Debugf("RADIUS: auth rejected — bad MS-CHAPv2 lengths (challenge=%d response=%d) user=%s",
+		logger.Infof("RADIUS: auth rejected — bad MS-CHAPv2 lengths (challenge=%d response=%d) user=%s",
 			len(challenge), len(response), username)
 		w.Write(r.Response(radius.CodeAccessReject))
 		return
@@ -1195,8 +1218,23 @@ ATTRIBUTE	Acct-Authentic		45	integer
 ATTRIBUTE	Acct-Session-Time	46	integer
 ATTRIBUTE	Acct-Input-Packets	47	integer
 ATTRIBUTE	Acct-Output-Packets	48	integer
+ATTRIBUTE	Acct-Terminate-Cause	49	integer
+ATTRIBUTE	Acct-Multi-Session-Id	50	string
+ATTRIBUTE	Acct-Link-Count		51	integer
+ATTRIBUTE	Acct-Input-Gigawords	52	integer
+ATTRIBUTE	Acct-Output-Gigawords	53	integer
+ATTRIBUTE	Event-Timestamp		55	integer
 ATTRIBUTE	CHAP-Challenge		60	string
 ATTRIBUTE	NAS-Port-Type		61	integer
+# ocserv (radcli) builds its Access-Request with these attributes too. radcli's
+# rc_avpair_new fails hard ("no attribute 0/N in dictionary") on any it can't find,
+# so the request is never constructed or sent and every OpenConnect login 401s.
+# Connect-Info (77, the client's user-agent) is the one ocserv ALWAYS adds — its
+# absence here was the OpenConnect auth bug. Harmless extra defs for the pppd path.
+ATTRIBUTE	Vendor-Specific		26	string
+ATTRIBUTE	Tunnel-Client-Endpoint	66	string
+ATTRIBUTE	Connect-Info		77	string
+ATTRIBUTE	NAS-Port-Id		87	string
 ATTRIBUTE	Acct-Interim-Interval	85	integer
 
 # Microsoft vendor-specific attributes (RFC 2548)

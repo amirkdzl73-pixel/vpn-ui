@@ -61,6 +61,7 @@ Tests (ids mirror harness/model.py:ALL_PHASES; always run in this fixed order):
   openvpn         connect variants + checks + peer reachability (OpenVPN)
   l2tp            connect variants + checks + peer reachability (L2TP/IPsec)
   pptp            connect variants + checks + peer reachability (PPTP)
+  openconnect     connect variants + checks + peer reachability (OpenConnect/ocserv)
   bulk-ops        bulk client add/sub/enable/disable + TXT/PDF export via API
   backup-restore  DB export + import round-trip
   warp-socks      Cloudflare warp-cli SOCKS install + egress

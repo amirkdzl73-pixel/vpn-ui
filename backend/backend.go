@@ -37,6 +37,7 @@ var Daemons = []Daemon{
 	{Name: "pptpd"},
 	{Name: "pptpctrl"},
 	{Name: "ocserv"},
+	{Name: "ocserv-worker"},
 	{Name: "occtl"},
 }
 

@@ -142,10 +142,36 @@ func (m *ProcManager) Start(name, bin string, args, env []string, dir string) er
 	defer p.mu.Unlock()
 	// Supersede any current instance/supervisor and stop it.
 	p.gen++
+	old := p.cmd
 	p.terminateLocked()
+	// Wait for the old instance to actually exit before launching the replacement.
+	// terminateLocked only *signals* it; relaunching immediately races the dying
+	// process for its listening port. Single-port daemons (ocserv binds one TCP+UDP
+	// port) then fail the new instance with "bind: Address in use" → exit 1 → a 5s
+	// procmgr restart window during which every client connection is refused.
+	if old != nil && old.Process != nil {
+		waitProcessExit(old.Process.Pid)
+	}
 	p.bin, p.args, p.env, p.dir = bin, args, env, dir
 	p.stopped = false
 	return p.launchLocked()
+}
+
+// waitProcessExit blocks until pid has exited — and thus released its ports —
+// escalating a graceful SIGTERM to SIGKILL if ignored. Bounded (~3s) so a wedged
+// process can't stall a restart forever. The old instance's supervisor reaps it
+// via cmd.Wait() concurrently (outside p.mu), so Kill(pid,0) flips to ESRCH once
+// it's gone.
+func waitProcessExit(pid int) {
+	for i := 0; i < 60; i++ { // up to ~3s (60 × 50ms)
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return
+		}
+		if i == 20 { // ~1s in and still alive → force it
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // launchLocked spawns the process and its supervisor goroutine (p.mu held).

@@ -17,7 +17,8 @@ from ..incus import Incus
 CLIENT_PKGS_APT = (
     "openvpn xl2tpd ppp strongswan strongswan-starter "
     "libstrongswan-extra-plugins libcharon-extra-plugins "
-    "pptp-linux ppp-mppe curl iproute2 net-tools dnsutils"
+    "pptp-linux ppp-mppe openconnect vpnc-scripts "
+    "curl iproute2 net-tools dnsutils"
 )
 
 

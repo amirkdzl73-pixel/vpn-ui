@@ -21,7 +21,7 @@ from .model import JobResult, SubTest, Status, PHASE_SETUP
 from .panel import Panel
 
 # protocol base octet for the 10.<base>.<id>.<host> tunnel address
-BASE = {"l2tp": 0, "pptp": 1, "ovpn-udp": 2, "ovpn-tcp": 3}
+BASE = {"l2tp": 0, "pptp": 1, "ovpn-udp": 2, "ovpn-tcp": 3, "openconnect": 4}
 
 PSK = "TestPSK-9182"  # L2TP/IPsec pre-shared key
 
@@ -32,6 +32,7 @@ PSK = "TestPSK-9182"  # L2TP/IPsec pre-shared key
 L2TP_USER_LIMIT = 2
 OVPN_USER_LIMIT = 2
 PPTP_USER_LIMIT = 2
+OC_USER_LIMIT = 2
 
 # Ports for the SECOND same-protocol inbound (protocols.py multi-inbound test).
 # Distinct from the primary ports (openvpn udp 1194 / tcp 1443, l2tp 1701, pptp
@@ -40,9 +41,10 @@ PPTP_USER_LIMIT = 2
 # differentiated by account -> RADIUS -> IP range — so for l2tp/pptp this port is
 # only a unique label; only openvpn actually listens on its own per-inbound port.
 SECOND_PORTS = {
-    "openvpn": {"udp": 1195, "tcp": 1444},
-    "l2tp":    {"udp": 1799},
-    "pptp":    {"udp": 1798},
+    "openvpn":     {"udp": 1195, "tcp": 1444},
+    "l2tp":        {"udp": 1799},
+    "pptp":        {"udp": 1798},
+    "openconnect": {"udp": 4444},
 }
 
 
@@ -95,6 +97,19 @@ def build_second_inbound(panel: Panel, proto: str) -> Inbound:
         inb = panel.add_inbound("test-pptp-2", ports["udp"], "pptp", settings)
         return Inbound(
             protocol="pptp", inbound_id=inb["id"], udp_port=ports["udp"],
+            tcp_port=0, accounts={"A": acct}, user_limit=1)
+    if proto == "openconnect":
+        cert = panel.generate_ocserv_cert()
+        settings = {
+            "dns1": "1.1.1.1", "dns2": "8.8.8.8", "mtu": 1420,
+            "tlsUseFile": False,
+            "certificate": cert["certificate"], "key": cert["key"],
+            "clientToClient": True, "crossInbound": True,
+            "clients": [_dict_client(acct)],
+        }
+        inb = panel.add_inbound("test-openconnect-2", ports["udp"], "openconnect", settings)
+        return Inbound(
+            protocol="openconnect", inbound_id=inb["id"], udp_port=ports["udp"],
             tcp_port=0, accounts={"A": acct}, user_limit=1)
     raise ValueError(proto)
 
@@ -251,6 +266,35 @@ def run(panel: Panel, server_ip: str, cfg: dict, result: JobResult,
 
     log(f"-> pptp-inbound [{pp.status.value}] {pp.detail}")
 
+    # ---- OpenConnect inbound --------------------------------------------
+    log("-> creating openconnect inbound (self-signed cert, 2 accounts)...")
+    oc = phase.add(SubTest("openconnect-inbound"))
+    try:
+        cert = panel.generate_ocserv_cert()
+        settings = {
+            "dns1": "1.1.1.1", "dns2": "8.8.8.8", "mtu": 1420,
+            "tlsUseFile": False,
+            "certificate": cert["certificate"], "key": cert["key"],
+            "clientToClient": True, "crossInbound": True,
+            "userLimit": OC_USER_LIMIT,  # exercise the RADIUS per-account block allocator
+            "clients": [_dict_client(_acct("ocserv", 0)),
+                        _dict_client(_acct("ocserv", 1))],
+        }
+        inb = panel.add_inbound("test-openconnect", 4443, "openconnect", settings)
+        iid = inb["id"]
+        sc.inbounds["openconnect"] = Inbound(
+            protocol="openconnect", inbound_id=iid, udp_port=4443, tcp_port=0,
+            accounts={"A": _acct("ocserv", 0), "B": _acct("ocserv", 1)},
+            user_limit=OC_USER_LIMIT,
+        )
+        oc.status = Status.PASS
+        oc.detail = f"inbound {iid}, port 4443 (TLS+DTLS), 2 accounts"
+    except Exception as e:  # noqa: BLE001
+        oc.status = Status.ERROR
+        oc.detail = str(e)[:300]
+
+    log(f"-> openconnect-inbound [{oc.status.value}] {oc.detail}")
+
     # ---- source-IP routing rules (built-in outbounds, no external link) ----
     # Prove Xray routes by source IP using the two outbounds every config already
     # ships: `direct` (freedom) and `blocked` (blackhole). Author by email (the
@@ -347,7 +391,7 @@ def run(panel: Panel, server_ip: str, cfg: dict, result: JobResult,
         xr.detail = str(e)[:300]
 
     # fatal only if we couldn't build any inbound
-    if all(p not in sc.inbounds for p in ("openvpn", "l2tp", "pptp")):
+    if all(p not in sc.inbounds for p in ("openvpn", "l2tp", "pptp", "openconnect")):
         return None
     return sc
 
