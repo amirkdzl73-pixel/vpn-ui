@@ -3270,11 +3270,28 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
     ipRanges = [],
     userLimit = 1,
     userLimitStrategy = "accept",
+    separatePorts = false,
+    tlsUseFile = false,
+    caCertFile = "",
+    serverCertFile = "",
+    serverKeyFile = "",
+    tlsCryptFile = "",
   ) {
     super(protocol);
     this.udpEnable = udpEnable;
     this.tcpEnable = tcpEnable;
     this.tcpPort = tcpPort;
+    // TCP + UDP share one port by default (both can bind the same number); flip
+    // this to give TCP its own tcpPort.
+    this.separatePorts = separatePorts;
+    // TLS cert source, mirroring the Xray model: inline content (default) or file
+    // paths. Path mode points OpenVPN at existing cert files instead of the
+    // generated/pasted PEM content.
+    this.tlsUseFile = tlsUseFile;
+    this.caCertFile = caCertFile;
+    this.serverCertFile = serverCertFile;
+    this.serverKeyFile = serverKeyFile;
+    this.tlsCryptFile = tlsCryptFile;
     this.dns1 = dns1;
     this.dns2 = dns2;
     this.mtu = mtu;
@@ -3325,6 +3342,12 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       Array.isArray(json.ipRanges) ? json.ipRanges.slice() : [],
       json.userLimit ?? 1,
       json.userLimitStrategy ?? "accept",
+      json.separatePorts ?? false,
+      json.tlsUseFile ?? false,
+      json.caCertFile ?? "",
+      json.serverCertFile ?? "",
+      json.serverKeyFile ?? "",
+      json.tlsCryptFile ?? "",
     );
   }
 
@@ -3333,6 +3356,12 @@ Inbound.OpenvpnSettings = class extends Inbound.Settings {
       udpEnable: this.udpEnable,
       tcpEnable: this.tcpEnable,
       tcpPort: this.tcpPort,
+      separatePorts: this.separatePorts,
+      tlsUseFile: this.tlsUseFile,
+      caCertFile: this.caCertFile,
+      serverCertFile: this.serverCertFile,
+      serverKeyFile: this.serverKeyFile,
+      tlsCryptFile: this.tlsCryptFile,
       dns1: this.dns1,
       dns2: this.dns2,
       mtu: this.mtu,

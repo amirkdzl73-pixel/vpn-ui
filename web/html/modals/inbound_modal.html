@@ -290,12 +290,15 @@
             },
             onProtocolChange(protocol) {
                 // Prefill the standard control port for the PPP-based VPN protocols
-                // (L2TP 1701, PPTP 1723) so the operator doesn't have to know them.
-                // Fires only on create — the protocol select is disabled when editing.
+                // (L2TP 1701, PPTP 1723) and OpenVPN (1194 — shared by TCP + UDP by
+                // default) so the operator doesn't have to know them. Fires only on
+                // create — the protocol select is disabled when editing.
                 if (protocol === 'l2tp') {
                     inModal.inbound.port = 1701;
                 } else if (protocol === 'pptp') {
                     inModal.inbound.port = 1723;
+                } else if (protocol === 'openvpn') {
+                    inModal.inbound.port = 1194;
                 }
             },
             streamNetworkChange() {

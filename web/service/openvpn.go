@@ -39,6 +39,7 @@ type openvpnSettings struct {
 	UdpEnable      *bool               `json:"udpEnable"` // nil == enabled (back-compat with pre-toggle inbounds)
 	TcpEnable      *bool               `json:"tcpEnable"` // nil == enabled
 	TcpPort        int                 `json:"tcpPort"`
+	SeparatePorts  *bool               `json:"separatePorts"` // nil == legacy (separate: TCP uses tcpPort); false == both on inbound.Port; true == separate
 	Dns1           string              `json:"dns1"`
 	Dns2           string              `json:"dns2"`
 	Mtu            int                 `json:"mtu"`
@@ -47,6 +48,14 @@ type openvpnSettings struct {
 	ServerCert     string              `json:"serverCert"`
 	ServerKey      string              `json:"serverKey"`
 	TlsCrypt       string              `json:"tlsCrypt"`
+	// TLS cert source (Xray-style): inline PEM content (default) or file paths.
+	// In path mode OpenVPN references these files directly instead of the content
+	// fields written into configDir.
+	TlsUseFile     *bool               `json:"tlsUseFile"`
+	CaCertFile     string              `json:"caCertFile"`
+	ServerCertFile string              `json:"serverCertFile"`
+	ServerKeyFile  string              `json:"serverKeyFile"`
+	TlsCryptFile   string              `json:"tlsCryptFile"`
 	CipherMode     string              `json:"cipherMode"` // old | new | all | custom (informative; Ciphers is authoritative)
 	Ciphers        []string            `json:"ciphers"`
 	ExternalProxy  []ovpnExternalProxy `json:"externalProxy"`
@@ -236,6 +245,45 @@ func (o *openvpnSettings) tcpPortOrDefault() int {
 	return o.TcpPort
 }
 
+// separatePorts reports whether TCP should listen on its own tcpPort instead of
+// sharing the inbound's (UDP) port. TCP and UDP are different transports, so both
+// can bind the same port number; the default for NEW inbounds is one shared port.
+// A nil pointer means a legacy inbound saved before this toggle existed — those
+// kept a distinct tcpPort, so nil is treated as "separate" to stay byte-identical.
+func (o *openvpnSettings) separatePorts() bool {
+	if o.SeparatePorts == nil {
+		return true
+	}
+	return *o.SeparatePorts
+}
+
+// tcpListenPort returns the port OpenVPN's TCP instance should bind: the shared
+// inbound port unless the admin opted into separate ports.
+func (o *openvpnSettings) tcpListenPort(inboundPort int) int {
+	if o.separatePorts() {
+		return o.tcpPortOrDefault()
+	}
+	return inboundPort
+}
+
+// useCertFiles reports whether OpenVPN should reference operator-supplied cert
+// file paths instead of the inline PEM content. Nil (legacy inbounds) == content.
+func (o *openvpnSettings) useCertFiles() bool {
+	return o.TlsUseFile != nil && *o.TlsUseFile
+}
+
+// certPaths returns the ca/cert/key/tls-crypt file paths OpenVPN's config should
+// reference: the operator's own paths in file mode, else the files writeCertFiles
+// writes into configDir from the inline PEM content.
+func (s *OpenVpnService) certPaths(inbound *model.Inbound, settings *openvpnSettings) (ca, cert, key, tlsCrypt string) {
+	if settings.useCertFiles() {
+		return strings.TrimSpace(settings.CaCertFile), strings.TrimSpace(settings.ServerCertFile),
+			strings.TrimSpace(settings.ServerKeyFile), strings.TrimSpace(settings.TlsCryptFile)
+	}
+	dir := s.configDir(inbound.Id)
+	return dir + "/ca.crt", dir + "/server.crt", dir + "/server.key", dir + "/tc.key"
+}
+
 type openvpnClient struct {
 	ID       string `json:"id"`       // OpenVPN username
 	Password string `json:"password"` // OpenVPN password
@@ -390,7 +438,7 @@ func (s *OpenVpnService) generateServerConfigs(inbound *model.Inbound) error {
 
 	ports := map[string]int{
 		"udp": inbound.Port,
-		"tcp": settings.tcpPortOrDefault(),
+		"tcp": settings.tcpListenPort(inbound.Port),
 	}
 	enabled := map[string]bool{
 		"udp": settings.udpEnabled(),
@@ -569,10 +617,11 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	// route, bypassing Xray entirely (mirrors the L2TP/PPTP noipv6 fix).
 	b.WriteString("push \"block-ipv6\"\n")
 	b.WriteString(fmt.Sprintf("tun-mtu %d\n", mtu))
-	b.WriteString(fmt.Sprintf("ca %s/ca.crt\n", dir))
-	b.WriteString(fmt.Sprintf("cert %s/server.crt\n", dir))
-	b.WriteString(fmt.Sprintf("key %s/server.key\n", dir))
-	b.WriteString(fmt.Sprintf("tls-crypt %s/tc.key\n", dir))
+	caPath, certPath, keyPath, tcPath := s.certPaths(inbound, settings)
+	b.WriteString(fmt.Sprintf("ca %s\n", caPath))
+	b.WriteString(fmt.Sprintf("cert %s\n", certPath))
+	b.WriteString(fmt.Sprintf("key %s\n", keyPath))
+	b.WriteString(fmt.Sprintf("tls-crypt %s\n", tcPath))
 	b.WriteString("dh none\n")
 	ciphers := s.effectiveCiphers(settings.dataCiphers())
 	_, legacyOK := s.cipherSupport()
@@ -604,11 +653,27 @@ func (s *OpenVpnService) buildServerConfig(inbound *model.Inbound, settings *ope
 	return b.String()
 }
 
+// clientCertContent returns the CA cert + tls-crypt key PEM to embed in a client
+// .ovpn, read from the operator's files in path mode or the inline fields.
+func (s *OpenVpnService) clientCertContent(settings *openvpnSettings) (ca, tlsCrypt string) {
+	if settings.useCertFiles() {
+		caB, _ := os.ReadFile(strings.TrimSpace(settings.CaCertFile))
+		tcB, _ := os.ReadFile(strings.TrimSpace(settings.TlsCryptFile))
+		return string(caB), string(tcB)
+	}
+	return settings.CaCert, settings.TlsCrypt
+}
+
 // writeCertFiles writes CA, server cert/key, and tls-crypt key to disk.
 func (s *OpenVpnService) writeCertFiles(inbound *model.Inbound) error {
 	settings, err := s.parseSettings(inbound)
 	if err != nil {
 		return err
+	}
+
+	// File mode: OpenVPN reads the operator's own cert files, so write nothing.
+	if settings.useCertFiles() {
+		return nil
 	}
 
 	dir := s.configDir(inbound.Id)
@@ -725,8 +790,9 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 		return "", err
 	}
 
-	if settings.CaCert == "" || settings.TlsCrypt == "" {
-		return "", fmt.Errorf("certificates not generated yet — use 'Generate Self-Signed CA' first")
+	caContent, tcContent := s.clientCertContent(settings)
+	if strings.TrimSpace(caContent) == "" || strings.TrimSpace(tcContent) == "" {
+		return "", fmt.Errorf("certificates not available — generate a self-signed CA or set the CA/tls-crypt file paths first")
 	}
 
 	// Refuse to hand out a profile for a transport the admin has switched off.
@@ -740,7 +806,7 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 	port := inbound.Port
 	protoStr := "udp"
 	if proto == "tcp" {
-		port = settings.tcpPortOrDefault()
+		port = settings.tcpListenPort(inbound.Port)
 		protoStr = "tcp"
 	}
 
@@ -822,10 +888,10 @@ func (s *OpenVpnService) GenerateClientConfig(inbound *model.Inbound, proto stri
 	b.WriteString("auth SHA256\n")
 	b.WriteString("verb 3\n")
 	b.WriteString("<ca>\n")
-	b.WriteString(strings.TrimSpace(settings.CaCert))
+	b.WriteString(strings.TrimSpace(caContent))
 	b.WriteString("\n</ca>\n")
 	b.WriteString("<tls-crypt>\n")
-	b.WriteString(strings.TrimSpace(settings.TlsCrypt))
+	b.WriteString(strings.TrimSpace(tcContent))
 	b.WriteString("\n</tls-crypt>\n")
 
 	return b.String(), nil

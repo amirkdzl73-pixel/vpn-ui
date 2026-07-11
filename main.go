@@ -445,9 +445,15 @@ func randomizeSetting() error {
 		normPath = "/"
 	}
 	// Resolve the server's public IPv4 the same way the dashboard does, then
-	// assemble the one-click panel URL (http, new port + web path).
+	// assemble the one-click panel URL. The scheme follows the TLS setting: a
+	// configured web cert (e.g. deploy.sh's self-signed option) means the panel
+	// serves HTTPS, so the printed link must match or it won't connect.
 	ip := service.GetServerIPv4()
-	url := fmt.Sprintf("http://%s:%d%s", ip, port, normPath)
+	scheme := "http"
+	if certFile, _ := settingService.GetCertFile(); certFile != "" {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://%s:%d%s", scheme, ip, port, normPath)
 
 	fmt.Println(ansiVpnUI())
 	fmt.Println("Randomized panel settings:")
@@ -659,6 +665,26 @@ func updateSetting(port int, username string, password string, webBasePath strin
 }
 
 // updateCert updates the SSL certificate files for the panel.
+// generateSelfSignedPanelCert generates a self-signed TLS certificate for the
+// panel, writes it next to the binary/DB (config dir + /cert), and points the
+// panel's webCertFile/webKeyFile at it so the web server serves HTTPS. Invoked by
+// `vpn-ui cert -selfsign` (used by deploy.sh's fresh-install HTTPS option). The
+// cert carries the server's public IP as a SAN; browsers still warn on the
+// self-signed issuer, which is expected.
+func generateSelfSignedPanelCert() {
+	dir := filepath.Join(config.GetDBFolderPath(), "cert")
+	ip := service.GetServerIPv4()
+	certPath, keyPath, err := service.GeneratePanelSelfSignedCert(dir, ip)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "self-signed cert generation failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Generated self-signed panel certificate:\n  cert: %s\n  key:  %s\n", certPath, keyPath)
+	// updateCert stores the paths in webCertFile/webKeyFile (+ subscription cert),
+	// which flips the web server to HTTPS on next start.
+	updateCert(certPath, keyPath)
+}
+
 func updateCert(publicKey string, privateKey string) {
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
@@ -1414,6 +1440,7 @@ func main() {
 	var reset bool
 	var show bool
 	var getCert bool
+	var selfSignCert bool
 	var resetTwoFactor bool
 	settingCmd.BoolVar(&reset, "reset", false, "Reset all settings")
 	settingCmd.BoolVar(&show, "show", false, "Display current settings")
@@ -1427,6 +1454,7 @@ func main() {
 	settingCmd.BoolVar(&getCert, "getCert", false, "Display current certificate settings")
 	settingCmd.StringVar(&webCertFile, "webCert", "", "Set path to public key file for panel")
 	settingCmd.StringVar(&webKeyFile, "webCertKey", "", "Set path to private key file for panel")
+	settingCmd.BoolVar(&selfSignCert, "selfsign", false, "Generate a self-signed TLS cert for the panel and enable HTTPS")
 	settingCmd.StringVar(&tgbottoken, "tgbottoken", "", "Set token for Telegram bot")
 	settingCmd.StringVar(&tgbotRuntime, "tgbotRuntime", "", "Set cron time for Telegram bot notifications")
 	settingCmd.StringVar(&tgbotchatid, "tgbotchatid", "", "Set chat ID for Telegram bot notifications")
@@ -1502,6 +1530,8 @@ func main() {
 		}
 		if reset {
 			updateCert("", "")
+		} else if selfSignCert {
+			generateSelfSignedPanelCert()
 		} else {
 			updateCert(webCertFile, webKeyFile)
 		}

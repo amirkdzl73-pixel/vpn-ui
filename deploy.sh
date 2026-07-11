@@ -131,6 +131,36 @@ ok "installed -> $DEST"
 # credentials (--random); updates DO NOT, so the operator's existing port, login
 # and web path survive the upgrade.
 if [[ "$MODE" == "install" ]]; then
+    # Panel transport: HTTP (default) or self-signed HTTPS. Honour PANEL_TLS when
+    # preset (selfsign/https -> TLS; http -> plain); otherwise ask on the
+    # controlling terminal. A piped, non-interactive install with no PANEL_TLS set
+    # falls back to HTTP so `curl ... | sudo bash` never hangs on a prompt.
+    tls_choice="http"
+    case "${PANEL_TLS:-}" in
+        selfsign|https|self-signed|1|yes) tls_choice="selfsign" ;;
+        http|plain|0|no)                  tls_choice="http" ;;
+        "")
+            if [[ -r /dev/tty ]]; then
+                {
+                    printf '%s::%s %sPanel access mode%s\n' "$B$BLUE" "$R" "$WHITE" "$R"
+                    printf '    %s1)%s HTTPS  (self-signed certificate)\n' "$GREEN" "$R"
+                    printf '    %s2)%s HTTP   (no TLS) %s[default]%s\n'     "$GREEN" "$R" "$D" "$R"
+                    printf '  choose [1/2]: '
+                } > /dev/tty
+                read -r _ans < /dev/tty || _ans=""
+                [[ "$_ans" == "1" ]] && tls_choice="selfsign"
+            fi
+            ;;
+        *) warn "unrecognized PANEL_TLS='${PANEL_TLS}' — defaulting to HTTP." ;;
+    esac
+
+    # Generate + enable the self-signed cert BEFORE --random so the randomized run
+    # sees the TLS setting and prints an https:// URL.
+    if [[ "$tls_choice" == "selfsign" ]]; then
+        msg "Generating self-signed TLS certificate (HTTPS)"
+        "$DEST" cert -selfsign
+    fi
+
     msg "Configuring credentials + installing systemd unit"
     warn "--random sets a fresh port, username, password and web path — note them below."
     "$DEST" --random --systemd
@@ -153,6 +183,8 @@ hr
 msg "Deploy complete"
 if [[ "$MODE" == "install" ]]; then
     act "the randomized login (port / user / password / web path) is printed above ${B}↑${R}"
+    [[ "${tls_choice:-http}" == "selfsign" ]] && \
+        act "panel serves ${GREEN}HTTPS${R} with a self-signed cert — the browser warns once; accept it to continue"
 else
     act "updated to ${GREEN}${ver:-latest}${R} — your existing port / login / web path are unchanged"
     [[ -n "${backup:-}" ]] && act "DB backup: ${TEAL}${backup}${R}"
