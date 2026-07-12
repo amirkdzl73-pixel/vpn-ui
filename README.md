@@ -74,7 +74,7 @@ sudo /opt/vpn-ui/vpn-ui-amd64 --uninstall
 
 ```mermaid
 flowchart TB
-  Client["VPN Client<br/>(L2TP/IPsec · PPTP · OpenVPN)"]
+  Client["VPN Client<br/>(L2TP/IPsec · PPTP · OpenVPN · OpenConnect)"]
 
   subgraph PANEL["vpn-ui panel — root process"]
     PROC["procmgr<br/>supervises the daemons"]
@@ -85,7 +85,7 @@ flowchart TB
   end
 
   subgraph DAEMON["Bundled VPN daemons (panel children)"]
-    D["xl2tpd + libreswan · pptpd · openvpn<br/>(pppd for L2TP/PPTP)"]
+    D["xl2tpd + libreswan · pptpd · openvpn · ocserv<br/>(pppd for L2TP/PPTP)"]
   end
 
   subgraph KERNEL["Linux kernel data plane"]
