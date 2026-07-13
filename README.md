@@ -13,6 +13,7 @@ This project is an enhanced version of the **[3X-UI](https://github.com/MHSanaei
 - L2TP/IPsec
 - OpenVPN
 - OpenConnect (cisco)
+- SSTP
 
 ## New Features
 
@@ -74,7 +75,7 @@ sudo /opt/vpn-ui/vpn-ui-amd64 --uninstall
 
 ```mermaid
 flowchart TB
-  Client["VPN Client<br/>(L2TP/IPsec · PPTP · OpenVPN · OpenConnect)"]
+  Client["VPN Client<br/>(L2TP/IPsec · PPTP · OpenVPN · OpenConnect · SSTP)"]
 
   subgraph PANEL["vpn-ui panel — root process"]
     PROC["procmgr<br/>supervises the daemons"]
@@ -85,7 +86,7 @@ flowchart TB
   end
 
   subgraph DAEMON["Bundled VPN daemons (panel children)"]
-    D["xl2tpd + libreswan · pptpd · openvpn · ocserv<br/>(pppd for L2TP/PPTP)"]
+    D["xl2tpd + libreswan · pptpd · openvpn · ocserv · accel-ppp<br/>(pppd for L2TP/PPTP · accel-ppp for SSTP)"]
   end
 
   subgraph KERNEL["Linux kernel data plane"]
@@ -152,6 +153,7 @@ A complete **E2E** test written in Python has been designed for this project ins
 | `l2tp` | connect variants + checks + peer reachability (L2TP/IPsec) |
 | `pptp` | connect variants + checks + peer reachability (PPTP) |
 | `openconnect` | connect variants + checks + peer reachability + same-NAT user-limit (OpenConnect/ocserv) |
+| `sstp` | connect variants + checks + peer reachability (SSTP/accel-ppp, PPP-over-TLS) |
 | `bulk-ops` | bulk client add/sub/enable/disable + TXT/PDF export via API |
 | `backup-restore` | DB export + import round-trip |
 | `warp-socks` | Cloudflare warp-cli SOCKS install + egress |
