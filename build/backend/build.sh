@@ -29,7 +29,10 @@ declare -A PLATFORM=(
 )
 
 ARCHES=("${@:-amd64}")
-
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker unavailable on Railway. Skipping backend daemon bundles."
+    exit 0
+fi
 build_arch() {
     local goarch="$1"
     local platform="${PLATFORM[$goarch]:-}"
