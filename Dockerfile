@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     bash
 
-RUN git submodule update --init --recursive
+RUN test -d third_party/Xray-core || git clone --depth 1 https://github.com/Sir-MmD/Xray-core third_party/Xray-core
 
 RUN chmod +x build.sh
 
